@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 AI TRADING SIGNALS - DAILY GENERATOR
 Automatically generates Buy/Sell/Hold signals for Indian stocks
@@ -67,11 +66,9 @@ def calculate_rsi(prices, period=14):
     changes = prices.diff()
     gains = changes.where(changes > 0, 0)
     losses = -changes.where(changes < 0, 0)
-    
     avg_gain = gains.rolling(window=period).mean()
     avg_loss = losses.rolling(window=period).mean()
     avg_loss = avg_loss.replace(0, 0.0001)  # Avoid division by zero
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
@@ -110,26 +107,24 @@ def generate_signal_for_stock(stock_symbol):
     Generate Buy/Sell/Hold signal for one stock
     Returns: dict with signal data or None if failed
     """
-    
     print(f"📈 Processing: {stock_symbol.replace('.NS', '')}...", end=" ")
     
     try:
-        # Download 90 days of data (need history for indicators)
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=90)
-        
+        # Download with flexible period (more reliable)
         data = yf.download(
-            stock_symbol, 
-            start=start_date, 
-            end=end_date, 
-            interval='1d', 
+            stock_symbol,
+            period='3mo',      # 3 months
+            interval='1d',
             progress=False,
             threads=False
         )
         
-        if data.empty or len(data) < 50:
-            print(f"❌ Insufficient data ({len(data)} days)")
+        # Check if we got enough data
+        if data.empty or len(data) < 30:
+            print(f"❌ Insufficient data ({len(data) if not data.empty else 0} days)")
             return None
+        
+        print(f"✅ Got {len(data)} days", end=" → ")
         
         # Calculate indicators
         rsi = calculate_rsi(data['Close'])
@@ -137,17 +132,23 @@ def generate_signal_for_stock(stock_symbol):
         bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(data['Close'])
         volume_high = calculate_volume_signal(data['Volume'])
         
-        # Get latest values
-        idx = -1
+        # ⚠️ CRITICAL FIX: Extract scalar values properly
+        idx = -1  # Last row
+        
+        # Use .iloc[idx] and convert to native Python types
         current_price = float(data['Close'].iloc[idx])
-        current_rsi = float(rsi.iloc[idx])
-        current_macd = float(macd.iloc[idx])
-        current_macd_signal = float(macd_signal.iloc[idx])
-        current_bb_upper = float(bb_upper.iloc[idx])
-        current_bb_lower = float(bb_lower.iloc[idx])
-        current_volume_high = bool(volume_high.iloc[idx])
         current_open = float(data['Open'].iloc[idx])
         current_close = float(data['Close'].iloc[idx])
+        
+        # Handle potential NaN values in indicators
+        current_rsi = float(rsi.iloc[idx]) if pd.notna(rsi.iloc[idx]) else 50.0
+        current_macd = float(macd.iloc[idx]) if pd.notna(macd.iloc[idx]) else 0.0
+        current_macd_signal = float(macd_signal.iloc[idx]) if pd.notna(macd_signal.iloc[idx]) else 0.0
+        current_bb_upper = float(bb_upper.iloc[idx]) if pd.notna(bb_upper.iloc[idx]) else current_price
+        current_bb_lower = float(bb_lower.iloc[idx]) if pd.notna(bb_lower.iloc[idx]) else current_price
+        
+        # For boolean, use .item() or bool()
+        current_volume_high = bool(volume_high.iloc[idx]) if pd.notna(volume_high.iloc[idx]) else False
         
         # Voting system
         votes = []
@@ -202,7 +203,7 @@ def generate_signal_for_stock(stock_symbol):
             final_signal = 'Hold'
             confidence = (max(buy_votes, sell_votes, hold_votes) / 5) * 100
         
-        print(f"✅ {final_signal} ({confidence:.0f}%)")
+        print(f"{final_signal} ({confidence:.0f}%)")
         
         return {
             'symbol': stock_symbol.replace('.NS', ''),
@@ -234,10 +235,9 @@ def upload_to_supabase(signal_data):
             signal_data,
             on_conflict='symbol,signal_date'
         ).execute()
-        
         return True
     except Exception as e:
-        print(f"   ⚠️  Failed to upload to Supabase: {str(e)}")
+        print(f"  ⚠️ Failed to upload to Supabase: {str(e)}")
         return False
 
 # ================================================================
@@ -261,7 +261,6 @@ def main():
         
         if signal_data:
             all_signals.append(signal_data)
-            
             # Upload to Supabase
             if upload_to_supabase(signal_data):
                 successful += 1
@@ -296,7 +295,7 @@ def main():
         top_signals = signals_df.nlargest(3, 'confidence')
         for _, row in top_signals.iterrows():
             emoji = '🟢' if row['signal'] == 'Buy' else '🔴' if row['signal'] == 'Sell' else '⚪'
-            print(f"   {emoji} {row['symbol']:12s} {row['signal']:5s} {row['confidence']:.0f}%  ₹{row['close_price']:.2f}")
+            print(f"  {emoji} {row['symbol']:12s} {row['signal']:5s} {row['confidence']:.0f}% ₹{row['close_price']:.2f}")
     
     print()
     print("=" * 70)
