@@ -1,0 +1,74 @@
+# ================================================================
+# AI TRADING SIGNALS - GITHUB ACTIONS WORKFLOW
+# Automatically runs daily at 6:00 PM IST (12:30 PM UTC)
+# Generates signals and uploads to Supabase
+# ================================================================
+
+name: Daily Signal Generator
+
+# When to run this workflow
+on:
+  # Schedule: Every day at 12:30 PM UTC = 6:00 PM IST
+  schedule:
+    - cron: '30 12 * * *'
+  
+  # Allow manual trigger (for testing)
+  workflow_dispatch:
+
+# Define the job
+jobs:
+  generate-signals:
+    runs-on: ubuntu-latest # Use Ubuntu Linux virtual machine
+    
+    steps:
+      # Step 1: Get the code from repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      # Step 2: Install Python
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      # Step 3: Install required Python packages
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy supabase-py
+      
+      # Step 4: Run the signal generator
+      - name: Generate daily signals
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          STOCK_LIST: ${{ secrets.STOCK_LIST }}
+        run: |
+          python daily_signal_generator.py
+      
+      # Step 5: Upload logs (optional, for debugging)
+      - name: Upload execution logs
+        if: always() # Run even if previous step failed
+        uses: actions/upload-artifact@v3
+        with:
+          name: signal-generation-logs
+          path: |
+            *.log
+            *.csv
+          retention-days: 7 # Keep logs for 7 days
+
+# ================================================================
+# CONFIGURATION NOTES:
+# 
+# - Runs automatically at 6 PM IST every day
+# - Also can be triggered manually (workflow_dispatch)
+# - Uses Python 3.11 (latest stable version)
+# - Installs fresh dependencies each time (ensures no conflicts)
+# - Reads secrets from GitHub Secrets (secure)
+# - Uploads logs for debugging (if needed)
+#
+# To test manually:
+# 1. Go to Actions tab
+# 2. Click "Daily Signal Generator"
+# 3. Click "Run workflow"
+# ================================================================
