@@ -114,9 +114,9 @@ def generate_signal_for_stock(stock_symbol):
     print(f"📈 Processing: {stock_symbol.replace('.NS', '')}...", end=" ")
     
     try:
-        # Download 60 days of data (need history for indicators)
+        # Download 90 days of data (need history for indicators)
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=60)
+        start_date = end_date - timedelta(days=90)
         
         data = yf.download(
             stock_symbol, 
