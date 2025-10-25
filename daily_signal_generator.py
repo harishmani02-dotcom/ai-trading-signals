@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI TRADING SIGNALS - DAILY GENERATOR (FIXED VERSION)
+AI TRADING SIGNALS - DAILY GENERATOR (PRICE FIX)
 Automatically generates Buy/Sell/Hold signals for Indian stocks
 """
 
@@ -56,23 +56,20 @@ except Exception as e:
 # HELPER FUNCTIONS
 # ================================================================
 
-def safe_float(value, default=0.0):
-    """Safely convert pandas value to float"""
+def get_value(series, idx):
+    """Safely extract scalar value from pandas Series"""
     try:
-        if pd.isna(value):
-            return default
-        return float(value)
-    except:
-        return default
-
-def safe_bool(value, default=False):
-    """Safely convert pandas value to bool"""
-    try:
-        if pd.isna(value):
-            return default
-        return bool(value)
-    except:
-        return default
+        val = series.iloc[idx]
+        # Handle MultiIndex columns from yfinance
+        if isinstance(val, pd.Series):
+            val = val.iloc[0]
+        # Convert to Python native type
+        if pd.isna(val):
+            return None
+        return float(val)
+    except Exception as e:
+        print(f" ⚠️ Error extracting value: {e}")
+        return None
 
 # ================================================================
 # TECHNICAL INDICATORS
@@ -112,42 +109,69 @@ def generate_signal(stock_symbol):
     print(f"📈 Processing: {stock_symbol.replace('.NS', '')}...", end=" ")
     
     try:
-        # Download data
-        df = yf.download(stock_symbol, period='3mo', interval='1d', 
-                        progress=False, threads=False)
+        # Download data - force single ticker to avoid MultiIndex
+        data = yf.download(
+            stock_symbol, 
+            period='3mo', 
+            interval='1d', 
+            progress=False,
+            auto_adjust=True, # Auto-adjust for splits/dividends
+            actions=False # Don't include corporate actions
+        )
         
-        if df.empty or len(df) < 30:
-            print(f"❌ Not enough data ({len(df)} days)")
+        if data.empty or len(data) < 30:
+            print(f"❌ Not enough data ({len(data)} days)")
             return None
         
-        print(f"✅ Got {len(df)} days", end=" → ")
-        
-        # Calculate indicators
-        rsi = calculate_rsi(df['Close'])
-        macd, macd_sig = calculate_macd(df['Close'])
-        bb_up, bb_mid, bb_low = calculate_bollinger(df['Close'])
-        
-        # Get LAST row values - THIS IS THE CRITICAL PART
-        last_idx = len(df) - 1
-        
-        # Extract scalar values using .iloc and convert to Python types
-        price = safe_float(df['Close'].iloc[last_idx])
-        open_price = safe_float(df['Open'].iloc[last_idx])
-        close_price = safe_float(df['Close'].iloc[last_idx])
-        
-        rsi_val = safe_float(rsi.iloc[last_idx], 50.0)
-        macd_val = safe_float(macd.iloc[last_idx], 0.0)
-        macd_sig_val = safe_float(macd_sig.iloc[last_idx], 0.0)
-        bb_up_val = safe_float(bb_up.iloc[last_idx], price)
-        bb_low_val = safe_float(bb_low.iloc[last_idx], price)
-        
-        # Volume
-        vol = safe_float(df['Volume'].iloc[last_idx], 0)
-        avg_vol = safe_float(df['Volume'].rolling(20).mean().iloc[last_idx], 0)
-        high_vol = vol > avg_vol
+        print(f"✅ Got {len(data)} days", end=" → ")
         
         # ============================================================
-        # VOTING SYSTEM - Using scalar values only!
+        # CRITICAL FIX: Access columns correctly
+        # yfinance sometimes returns MultiIndex columns
+        # ============================================================
+        
+        # Flatten columns if MultiIndex
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        
+        # Extract price columns
+        close_col = data['Close']
+        open_col = data['Open']
+        volume_col = data['Volume']
+        
+        # Get LAST valid index
+        last_idx = -1
+        
+        # Extract prices - with validation
+        close_price = get_value(close_col, last_idx)
+        open_price = get_value(open_col, last_idx)
+        volume = get_value(volume_col, last_idx)
+        
+        # Validate we got prices
+        if close_price is None or close_price <= 0:
+            print(f"❌ Invalid price data (close={close_price})")
+            return None
+        
+        print(f"Price: ₹{close_price:.2f}", end=" → ")
+        
+        # Calculate indicators
+        rsi = calculate_rsi(close_col)
+        macd, macd_sig = calculate_macd(close_col)
+        bb_up, bb_mid, bb_low = calculate_bollinger(close_col)
+        
+        # Extract indicator values
+        rsi_val = get_value(rsi, last_idx) or 50.0
+        macd_val = get_value(macd, last_idx) or 0.0
+        macd_sig_val = get_value(macd_sig, last_idx) or 0.0
+        bb_up_val = get_value(bb_up, last_idx) or close_price
+        bb_low_val = get_value(bb_low, last_idx) or close_price
+        
+        # Volume analysis
+        avg_vol = volume_col.rolling(20).mean().iloc[last_idx]
+        high_vol = volume > avg_vol if volume and avg_vol else False
+        
+        # ============================================================
+        # VOTING SYSTEM
         # ============================================================
         
         votes = []
@@ -167,16 +191,16 @@ def generate_signal(stock_symbol):
             votes.append('Sell')
         
         # Vote 3: Bollinger Bands
-        if price < bb_low_val:
+        if close_price < bb_low_val:
             votes.append('Buy')
-        elif price > bb_up_val:
+        elif close_price > bb_up_val:
             votes.append('Sell')
         else:
             votes.append('Hold')
         
         # Vote 4: Volume
         if high_vol and len(votes) > 0:
-            votes.append(votes[-1]) # Confirm last vote
+            votes.append(votes[-1])
         else:
             votes.append('Hold')
         
@@ -204,20 +228,31 @@ def generate_signal(stock_symbol):
         
         print(f"{signal} ({confidence:.0f}%)")
         
-        return {
+        # ============================================================
+        # RETURN DATA WITH VALIDATED PRICES
+        # ============================================================
+        
+        result = {
             'symbol': stock_symbol.replace('.NS', ''),
             'signal': signal,
-            'confidence': round(confidence, 1),
-            'close_price': round(price, 2),
-            'rsi': round(rsi_val, 1),
-            'buy_votes': buy_count,
-            'sell_votes': sell_count,
-            'hold_votes': hold_count,
+            'confidence': round(float(confidence), 1),
+            'close_price': round(float(close_price), 2),
+            'rsi': round(float(rsi_val), 1),
+            'buy_votes': int(buy_count),
+            'sell_votes': int(sell_count),
+            'hold_votes': int(hold_count),
             'signal_date': datetime.now().date().isoformat()
         }
         
+        # Debug: Print what we're returning
+        print(f" 💰 Storing price: ₹{result['close_price']}")
+        
+        return result
+        
     except Exception as e:
         print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # ================================================================
@@ -227,11 +262,19 @@ def generate_signal(stock_symbol):
 def upload_signal(data):
     """Upload signal to database"""
     try:
-        supabase.table('signals').upsert(
+        # Validate data before upload
+        if data['close_price'] <= 0:
+            print(f" ⚠️ Invalid price {data['close_price']}, skipping upload")
+            return False
+        
+        response = supabase.table('signals').upsert(
             data, 
             on_conflict='symbol,signal_date'
         ).execute()
+        
+        print(f" ✅ Uploaded to Supabase (price: ₹{data['close_price']})")
         return True
+        
     except Exception as e:
         print(f" ⚠️ Upload failed: {e}")
         return False
@@ -273,11 +316,20 @@ def main():
     
     if results:
         df = pd.DataFrame(results)
+        
+        # Validate prices
+        zero_prices = df[df['close_price'] == 0]
+        if len(zero_prices) > 0:
+            print(f"\n⚠️ WARNING: {len(zero_prices)} stocks have zero price!")
+            for _, row in zero_prices.iterrows():
+                print(f" - {row['symbol']}: price = {row['close_price']}")
+        
         print()
         print(f"🟢 Buy signals: {len(df[df['signal'] == 'Buy'])}")
         print(f"🔴 Sell signals: {len(df[df['signal'] == 'Sell'])}")
         print(f"⚪ Hold signals: {len(df[df['signal'] == 'Hold'])}")
         print(f"📈 Average confidence: {df['confidence'].mean():.1f}%")
+        print(f"💰 Average price: ₹{df['close_price'].mean():.2f}")
         
         # Top 3
         print("\n🏆 TOP 3 SIGNALS:")
