@@ -58,7 +58,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # ================================================================
 # SANITIZE / PARSE TICKER LIST
 # ================================================================
-# Allow typical tickers like RELIANCE.NS, AAPL, INFY.NS, etc.
+# Ticker pattern: e.g. RELIANCE.NS, INFY, AAPL, etc.
 TICKER_RE = re.compile(r'^[A-Z0-9][A-Z0-9._-]{0,18}(?:\.[A-Z]{1,5})?$')
 
 def sanitize_tickers(raw: str):
@@ -69,10 +69,21 @@ def sanitize_tickers(raw: str):
             continue
         # remove surrounding quotes and common punctuation
         t = t.strip(" '\"`;:()[]{}<>")
-        # collapse whitespace and use first token
-        t = t.split()[0].upper()
+        # if removing punctuation made it empty, skip
+        if not t:
+            logging.debug(f"Skipped empty token after strip: {part!r}")
+            continue
+        # split by whitespace and use first token (if any)
+        tokens = t.split()
+        if not tokens:
+            logging.debug(f"No tokens found after split: {part!r}")
+            continue
+        t = tokens[0].upper()
         # remove any characters that aren't allowed in tickers
-        t = re.sub(r'[^A-Z0-9._\-\.]', '', t)
+        t = re.sub(r'[^A-Z0-9._-]', '', t)
+        if not t:
+            logging.debug(f"Empty after removing invalid chars: {part!r}")
+            continue
         if TICKER_RE.match(t):
             items.append(t)
         else:
@@ -109,16 +120,11 @@ except Exception as e:
     print(f"{EMOJI_CROSS} Failed to connect: {e}")
     sys.exit(1)
 
-# ================================================================
-# HELPER FUNCTIONS
-# ================================================================
+# (Remaining code unchanged from prior working version)
 def get_value(series, idx):
-    """Safely extract scalar value from pandas Series"""
     try:
         val = series.iloc[idx]
-        # If val is a Series (e.g., MultiIndex), pick first numeric value
         if isinstance(val, pd.Series):
-            # find first non-null
             for v in val:
                 if not pd.isna(v):
                     val = v
@@ -132,9 +138,6 @@ def get_value(series, idx):
         logging.debug(f"Error extracting value: {e}")
         return None
 
-# ================================================================
-# TECHNICAL INDICATORS
-# ================================================================
 def calculate_rsi(prices, period=14):
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -156,9 +159,6 @@ def calculate_bollinger(prices, period=20):
     lower = sma - (2 * std)
     return upper, sma, lower
 
-# ================================================================
-# YFINANCE FETCH WITH RETRIES
-# ================================================================
 def fetch_history_with_retries(ticker: str, period='3mo', interval='1d', max_retries=3, min_days=30, pause_base=0.6):
     for attempt in range(1, max_retries + 1):
         try:
@@ -171,12 +171,10 @@ def fetch_history_with_retries(ticker: str, period='3mo', interval='1d', max_ret
                 auto_adjust=True,
                 actions=False,
             )
-            # If MultiIndex columns (rare when passing single ticker), flatten
             if hasattr(data, "columns") and isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             if data is None or data.empty:
                 raise ValueError("Empty history returned")
-            # Ensure Close exists and contains enough valid rows
             if 'Close' not in data.columns:
                 raise ValueError("Close column missing")
             valid_closes = data['Close'].dropna()
@@ -193,11 +191,7 @@ def fetch_history_with_retries(ticker: str, period='3mo', interval='1d', max_ret
                 logging.error(f"Giving up on {ticker} after {max_retries} attempts")
                 return None
 
-# ================================================================
-# SIGNAL GENERATION
-# ================================================================
 def generate_signal(stock_symbol):
-    """Generate signal for one stock"""
     pretty = stock_symbol.replace('.NS', '')
     print(f"{EMOJI_CHART} Processing: {pretty}...", end=" ")
     try:
@@ -208,11 +202,9 @@ def generate_signal(stock_symbol):
 
         print(f"{EMOJI_CHECK} Got {len(data)} days", end=f" {EMOJI_ARROW} ")
 
-        # Ensure columns flattened
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
-        # Required columns
         if not all(c in data.columns for c in ('Close', 'Open', 'Volume')):
             print(f"{EMOJI_CROSS} Missing required columns")
             return None
@@ -232,7 +224,6 @@ def generate_signal(stock_symbol):
 
         print(f"Price: {EMOJI_RUPEE}{close_price:.2f}", end=f" {EMOJI_ARROW} ")
 
-        # Indicators
         rsi = calculate_rsi(close_col)
         macd, macd_sig = calculate_macd(close_col)
         bb_up, bb_mid, bb_low = calculate_bollinger(close_col)
@@ -243,17 +234,14 @@ def generate_signal(stock_symbol):
         bb_up_val = get_value(bb_up, last_idx) or close_price
         bb_low_val = get_value(bb_low, last_idx) or close_price
 
-        # Volume analysis (safe)
         try:
             avg_vol = float(volume_col.rolling(20).mean().iloc[last_idx])
         except Exception:
             avg_vol = None
         high_vol = (volume is not None and avg_vol is not None and volume > avg_vol)
 
-        # Voting system
         votes = []
 
-        # RSI
         if rsi_val < 30:
             votes.append('Buy')
         elif rsi_val > 70:
@@ -261,10 +249,8 @@ def generate_signal(stock_symbol):
         else:
             votes.append('Hold')
 
-        # MACD
         votes.append('Buy' if macd_val > macd_sig_val else 'Sell')
 
-        # Bollinger
         if close_price < bb_low_val:
             votes.append('Buy')
         elif close_price > bb_up_val:
@@ -272,13 +258,11 @@ def generate_signal(stock_symbol):
         else:
             votes.append('Hold')
 
-        # Volume: reinforce last meaningful vote if high volume
         if high_vol and votes:
             votes.append(votes[-1])
         else:
             votes.append('Hold')
 
-        # Candlestick
         if open_price is not None and close_price > open_price:
             votes.append('Buy')
         else:
@@ -320,11 +304,7 @@ def generate_signal(stock_symbol):
         logging.exception(f"{EMOJI_CROSS} Error processing {stock_symbol}: {e}")
         return None
 
-# ================================================================
-# UPLOAD TO SUPABASE
-# ================================================================
 def upload_signal(data):
-    """Upload signal to database"""
     try:
         if data is None:
             return False
@@ -337,7 +317,6 @@ def upload_signal(data):
             on_conflict='symbol,signal_date'
         ).execute()
 
-        # supabase client returns dict-like response; check for error key
         if isinstance(resp, dict) and resp.get('error'):
             logging.error(f"{EMOJI_WARNING} Supabase error: {resp.get('error')}")
             return False
@@ -349,11 +328,8 @@ def upload_signal(data):
         logging.exception(f" {EMOJI_WARNING} Upload failed: {e}")
         return False
 
-# ================================================================
-# MAIN
-# ================================================================
 def main():
-    print(f"{EMOJI_ROCKET} Starting signal generation...\n")
+    print(f"{EMOJI_ROCKET} Starting signal generation...n")
 
     success = 0
     failed = 0
@@ -376,10 +352,8 @@ def main():
             failed += 1
             failed_tickers.append(stock)
 
-        # polite pause with jitter to reduce rate-limit risk
         time.sleep(0.8 + uniform(0, 0.4))
 
-    # Dump failed tickers for post-mortem
     if failed_tickers:
         try:
             with open('failed_tickers.txt', 'w') as fh:
@@ -389,7 +363,6 @@ def main():
         except Exception:
             logging.exception("Failed to write failed_tickers.txt")
 
-    # Summary
     print()
     print("=" * 70)
     print(f"{EMOJI_CHART} SUMMARY")
@@ -423,7 +396,6 @@ def main():
     print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
     print("=" * 70)
 
-    # Only fail if nothing succeeded (prevents spurious CI failure due to intermittent ticker-level problems)
     sys.exit(0 if success > 0 else 1)
 
 if __name__ == "__main__":
