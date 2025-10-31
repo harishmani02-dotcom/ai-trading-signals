@@ -20,6 +20,23 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+# Emoji constants (use these in f-strings)
+EMOJI_ROBOT   = "🤖"
+EMOJI_CAL     = "📅"
+EMOJI_CHART   = "📊"
+EMOJI_LINK    = "🔗"
+EMOJI_CHECK   = "✅"
+EMOJI_CROSS   = "❌"
+EMOJI_RUPEE   = "₹"
+EMOJI_MONEY   = "💰"
+EMOJI_GREEN   = "🟢"
+EMOJI_RED     = "🔴"
+EMOJI_WHITE   = "⚪"
+EMOJI_CLOCK   = "🕐"
+EMOJI_WARNING = "⚠️"
+EMOJI_ARROW   = "→"
+EMOJI_ROCKET  = "🚀"
+
 # ================================================================
 # CONFIGURATION
 # ================================================================
@@ -35,14 +52,14 @@ logging.basicConfig(
 )
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("u{274c} ERROR: Missing SUPABASE credentials")
+    print(f"{EMOJI_CROSS} ERROR: Missing SUPABASE credentials")
     sys.exit(1)
 
 # ================================================================
 # SANITIZE / PARSE TICKER LIST
 # ================================================================
 # Allow typical tickers like RELIANCE.NS, AAPL, INFY.NS, etc.
-TICKER_RE = re.compile(r'^[A-Z0-9][A-Z0-9\.\-_]{0,18}(?:\.[A-Z]{1,5})?$')
+TICKER_RE = re.compile(r'^[A-Z0-9][A-Z0-9._-]{0,18}(?:\.[A-Z]{1,5})?$')
 
 def sanitize_tickers(raw: str):
     items = []
@@ -50,10 +67,12 @@ def sanitize_tickers(raw: str):
         t = str(part).strip()
         if not t:
             continue
-        # remove surrounding quotes and weird punctuation
-        t = t.strip(" \t\n\r\"'`;:()[]{}<>")
-        # collapse whitespace and take first token if multiple are present
+        # remove surrounding quotes and common punctuation
+        t = t.strip(" '\"`;:()[]{}<>")
+        # collapse whitespace and use first token
         t = t.split()[0].upper()
+        # remove any characters that aren't allowed in tickers
+        t = re.sub(r'[^A-Z0-9._\-\.]', '', t)
         if TICKER_RE.match(t):
             items.append(t)
         else:
@@ -70,11 +89,11 @@ def sanitize_tickers(raw: str):
 STOCKS = sanitize_tickers(STOCK_LIST)
 
 print("=" * 70)
-print("u{1f916} AI TRADING SIGNALS - DAILY GENERATOR")
+print(f"{EMOJI_ROBOT} AI TRADING SIGNALS - DAILY GENERATOR")
 print("=" * 70)
-print(f"u{1f4c5} Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
-print(f"u{1f4ca} Stocks to analyze: {len(STOCKS)}")
-print(f"u{1f517} Supabase URL: {SUPABASE_URL[:30]}...")
+print(f"{EMOJI_CAL} Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
+print(f"{EMOJI_CHART} Stocks to analyze: {len(STOCKS)}")
+print(f"{EMOJI_LINK} Supabase URL: {SUPABASE_URL[:30]}...")
 print("=" * 70)
 print()
 
@@ -84,10 +103,10 @@ print()
 try:
     from supabase import create_client
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("u{2705} Connected to Supabase successfully")
+    print(f"{EMOJI_CHECK} Connected to Supabase successfully")
     print()
 except Exception as e:
-    print(f"u{274c} Failed to connect: {e}")
+    print(f"{EMOJI_CROSS} Failed to connect: {e}")
     sys.exit(1)
 
 # ================================================================
@@ -166,7 +185,6 @@ def fetch_history_with_retries(ticker: str, period='3mo', interval='1d', max_ret
             return data
         except Exception as e:
             logging.warning(f"Failed fetch for {ticker}: {e}")
-            # If Yahoo downtime explicit message, don't spam retries - still try few times
             if attempt < max_retries:
                 sleep_time = pause_base * (2 ** (attempt - 1)) + uniform(0, 0.5)
                 logging.info(f"Sleeping {sleep_time:.2f}s before retry")
@@ -181,14 +199,14 @@ def fetch_history_with_retries(ticker: str, period='3mo', interval='1d', max_ret
 def generate_signal(stock_symbol):
     """Generate signal for one stock"""
     pretty = stock_symbol.replace('.NS', '')
-    print(f"u{1f4c8} Processing: {pretty}...", end=" ")
+    print(f"{EMOJI_CHART} Processing: {pretty}...", end=" ")
     try:
         data = fetch_history_with_retries(stock_symbol, period='3mo', interval='1d', max_retries=3, min_days=30)
         if data is None:
-            print(f"u{274c} Not enough data or fetch failed")
+            print(f"{EMOJI_CROSS} Not enough data or fetch failed")
             return None
 
-        print(f"u{2705} Got {len(data)} days", end=" u{2192} ")
+        print(f"{EMOJI_CHECK} Got {len(data)} days", end=f" {EMOJI_ARROW} ")
 
         # Ensure columns flattened
         if isinstance(data.columns, pd.MultiIndex):
@@ -196,7 +214,7 @@ def generate_signal(stock_symbol):
 
         # Required columns
         if not all(c in data.columns for c in ('Close', 'Open', 'Volume')):
-            print(f"u{274c} Missing required columns")
+            print(f"{EMOJI_CROSS} Missing required columns")
             return None
 
         close_col = data['Close']
@@ -209,10 +227,10 @@ def generate_signal(stock_symbol):
         volume = get_value(volume_col, last_idx)
 
         if close_price is None or close_price <= 0:
-            print(f"u{274c} Invalid price data (close={close_price})")
+            print(f"{EMOJI_CROSS} Invalid price data (close={close_price})")
             return None
 
-        print(f"Price: u{20b9}{close_price:.2f}", end=" u{2192} ")
+        print(f"Price: {EMOJI_RUPEE}{close_price:.2f}", end=f" {EMOJI_ARROW} ")
 
         # Indicators
         rsi = calculate_rsi(close_col)
@@ -294,12 +312,12 @@ def generate_signal(stock_symbol):
             'signal_date': datetime.now().date().isoformat()
         }
 
-        print(f" u{1f4b0} Storing price: u{20b9}{result['close_price']}")
+        print(f"{EMOJI_MONEY} Storing price: {EMOJI_RUPEE}{result['close_price']}")
 
         return result
 
     except Exception as e:
-        logging.exception(f"u{274c} Error processing {stock_symbol}: {e}")
+        logging.exception(f"{EMOJI_CROSS} Error processing {stock_symbol}: {e}")
         return None
 
 # ================================================================
@@ -311,7 +329,7 @@ def upload_signal(data):
         if data is None:
             return False
         if data.get('close_price') is None or data['close_price'] <= 0:
-            logging.warning(f"u{26a0}u{fe0f} Invalid price {data.get('close_price')}, skipping upload")
+            logging.warning(f"{EMOJI_WARNING} Invalid price {data.get('close_price')}, skipping upload")
             return False
 
         resp = supabase.table('signals').upsert(
@@ -319,25 +337,23 @@ def upload_signal(data):
             on_conflict='symbol,signal_date'
         ).execute()
 
-        # supabase client returns dict-like response; check for errors
-        if hasattr(resp, 'status_code'):
-            status = getattr(resp, 'status_code')
-            if status and status >= 400:
-                logging.error(f"u{26a0}u{fe0f} Upload failed status {status}")
-                return False
+        # supabase client returns dict-like response; check for error key
+        if isinstance(resp, dict) and resp.get('error'):
+            logging.error(f"{EMOJI_WARNING} Supabase error: {resp.get('error')}")
+            return False
 
-        print(f" u{2705} Uploaded to Supabase (price: u{20b9}{data['close_price']})")
+        print(f" {EMOJI_CHECK} Uploaded to Supabase (price: {EMOJI_RUPEE}{data['close_price']})")
         return True
 
     except Exception as e:
-        logging.exception(f" u{26a0}u{fe0f} Upload failed: {e}")
+        logging.exception(f" {EMOJI_WARNING} Upload failed: {e}")
         return False
 
 # ================================================================
 # MAIN
 # ================================================================
 def main():
-    print("u{1f680} Starting signal generation...\n")
+    print(f"{EMOJI_ROCKET} Starting signal generation...\n")
 
     success = 0
     failed = 0
@@ -376,35 +392,35 @@ def main():
     # Summary
     print()
     print("=" * 70)
-    print("u{1f4ca} SUMMARY")
+    print(f"{EMOJI_CHART} SUMMARY")
     print("=" * 70)
-    print(f"u{2705} Successfully processed: {success} stocks")
-    print(f"u{274c} Failed: {failed} stocks")
+    print(f"{EMOJI_CHECK} Successfully processed: {success} stocks")
+    print(f"{EMOJI_CROSS} Failed: {failed} stocks")
 
     if results:
         df = pd.DataFrame(results)
         zero_prices = df[df['close_price'] == 0]
         if len(zero_prices) > 0:
-            print(f"\nu{26a0}u{fe0f} WARNING: {len(zero_prices)} stocks have zero price!")
+            print(f"\n{EMOJI_WARNING} WARNING: {len(zero_prices)} stocks have zero price!")
             for _, row in zero_prices.iterrows():
                 print(f" - {row['symbol']}: price = {row['close_price']}")
 
         print()
-        print(f"u{1f7e2} Buy signals: {len(df[df['signal'] == 'Buy'])}")
-        print(f"u{1f534} Sell signals: {len(df[df['signal'] == 'Sell'])}")
-        print(f"u{26aa} Hold signals: {len(df[df['signal'] == 'Hold'])}")
-        print(f"u{1f4c8} Average confidence: {df['confidence'].mean():.1f}%")
-        print(f"u{1f4b0} Average price: u{20b9}{df['close_price'].mean():.2f}")
+        print(f"{EMOJI_GREEN} Buy signals: {len(df[df['signal'] == 'Buy'])}")
+        print(f"{EMOJI_RED} Sell signals: {len(df[df['signal'] == 'Sell'])}")
+        print(f"{EMOJI_WHITE} Hold signals: {len(df[df['signal'] == 'Hold'])}")
+        print(f"{EMOJI_CHART} Average confidence: {df['confidence'].mean():.1f}%")
+        print(f"{EMOJI_MONEY} Average price: {EMOJI_RUPEE}{df['close_price'].mean():.2f}")
 
-        print("\nu{1f3c6} TOP 3 SIGNALS:")
+        print(f"\n{EMOJI_MONEY} TOP 3 SIGNALS:")
         for _, row in df.nlargest(3, 'confidence').iterrows():
-            emoji = 'u{1f7e2}' if row['signal'] == 'Buy' else 'u{1f534}' if row['signal'] == 'Sell' else 'u{26aa}'
-            print(f" {emoji} {row['symbol']:12s} {row['signal']:5s} {row['confidence']:.0f}% u{20b9}{row['close_price']:.2f}")
+            emoji = EMOJI_GREEN if row['signal'] == 'Buy' else EMOJI_RED if row['signal'] == 'Sell' else EMOJI_WHITE
+            print(f" {emoji} {row['symbol']:12s} {row['signal']:5s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f}")
 
     print()
     print("=" * 70)
-    print("u{2705} DAILY SIGNAL GENERATION COMPLETE!")
-    print(f"u{1f550} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"{EMOJI_CHECK} DAILY SIGNAL GENERATION COMPLETE!")
+    print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
     print("=" * 70)
 
     # Only fail if nothing succeeded (prevents spurious CI failure due to intermittent ticker-level problems)
