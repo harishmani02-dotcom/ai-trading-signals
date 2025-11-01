@@ -21,21 +21,21 @@ import numpy as np
 from datetime import datetime
 
 # Emoji constants
-EMOJI_ROBOT   = "🤖"
-EMOJI_CAL     = "📅"
-EMOJI_CHART   = "📊"
-EMOJI_LINK    = "🔗"
-EMOJI_CHECK   = "✅"
-EMOJI_CROSS   = "❌"
-EMOJI_RUPEE   = "₹"
-EMOJI_MONEY   = "💰"
-EMOJI_GREEN   = "🟢"
-EMOJI_RED     = "🔴"
-EMOJI_WHITE   = "⚪"
-EMOJI_CLOCK   = "🕐"
+EMOJI_ROBOT = "🤖"
+EMOJI_CAL = "📅"
+EMOJI_CHART = "📊"
+EMOJI_LINK = "🔗"
+EMOJI_CHECK = "✅"
+EMOJI_CROSS = "❌"
+EMOJI_RUPEE = "₹"
+EMOJI_MONEY = "💰"
+EMOJI_GREEN = "🟢"
+EMOJI_RED = "🔴"
+EMOJI_WHITE = "⚪"
+EMOJI_CLOCK = "🕐"
 EMOJI_WARNING = "⚠️"
-EMOJI_ARROW   = "→"
-EMOJI_ROCKET  = "🚀"
+EMOJI_ARROW = "→"
+EMOJI_ROCKET = "🚀"
 
 # ================================================================
 # CONFIGURATION
@@ -46,10 +46,10 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 STOCK_LIST = os.getenv('STOCK_LIST', 'RELIANCE.NS,TCS.NS,INFY.NS')
 
 # Performance settings
-MAX_WORKERS = 10  # Parallel downloads
-BATCH_SIZE = 20   # Upload batch size
+MAX_WORKERS = 10 # Parallel downloads
+BATCH_SIZE = 20 # Upload batch size
 RETRY_DELAY = 0.5 # Reduced from exponential backoff
-MAX_RETRIES = 2   # Reduced from 3
+MAX_RETRIES = 3 # Increased to 3 for better success rate
 
 # Basic logging
 logging.basicConfig(
@@ -123,13 +123,29 @@ except Exception as e:
 # ================================================================
 
 def get_value(series, idx):
-    """Fast value extraction with minimal error handling"""
+    """Fast value extraction with better validation"""
     try:
+        if series is None or len(series) == 0:
+            return None
+        
         val = series.iloc[idx]
+        
+        # Handle Series within Series
         if isinstance(val, pd.Series):
             val = val.iloc[0] if len(val) > 0 else None
-        return float(val) if pd.notna(val) else None
-    except:
+        
+        # Convert to float and validate
+        if pd.isna(val):
+            return None
+        
+        float_val = float(val)
+        
+        # Additional validation: reject extremely small or negative prices
+        if float_val <= 0 or float_val < 0.01:
+            return None
+            
+        return float_val
+    except (IndexError, ValueError, TypeError):
         return None
 
 def calculate_indicators(prices):
@@ -168,75 +184,110 @@ def calculate_indicators(prices):
     }
 
 def fetch_history_fast(ticker: str, max_retries=MAX_RETRIES):
-    """Optimized fetch with reduced retries"""
+    """Optimized fetch with better error handling"""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
                 time.sleep(RETRY_DELAY)
             
-            data = yf.download(
-                ticker,
-                period='3mo',
-                interval='1d',
-                progress=False,
-                auto_adjust=True,
-                actions=False,
-                threads=False  # Disable internal threading
-            )
+            # Create a new Ticker object each time to avoid stale sessions
+            stock = yf.Ticker(ticker)
+            data = stock.history(period='3mo', auto_adjust=True)
             
+            # Handle MultiIndex columns
             if hasattr(data, "columns") and isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             
-            if data is None or data.empty or len(data) < 30:
-                raise ValueError("Insufficient data")
+            # Validate data
+            if data is None or data.empty:
+                raise ValueError("Empty data")
+            
+            if len(data) < 30:
+                raise ValueError(f"Only {len(data)} rows")
             
             if 'Close' not in data.columns:
                 raise ValueError("Missing Close column")
+            
+            # Ensure we have valid close prices
+            valid_closes = data['Close'].dropna()
+            if len(valid_closes) < 30:
+                raise ValueError(f"Only {len(valid_closes)} valid closes")
+            
+            # Check if last close price is valid
+            last_close = data['Close'].iloc[-1]
+            if pd.isna(last_close) or last_close <= 0:
+                raise ValueError(f"Invalid last close: {last_close}")
             
             return data
             
         except Exception as e:
             if attempt == max_retries:
-                logging.error(f"Failed {ticker}: {e}")
+                logging.debug(f"Failed {ticker} after {max_retries} attempts: {e}")
                 return None
     return None
 
 def generate_signal(stock_symbol, stock_num=0, total=0):
-    """Optimized signal generation"""
+    """Optimized signal generation with robust error handling"""
     pretty = stock_symbol.replace('.NS', '')
     prefix = f"[{stock_num}/{total}] " if total > 0 else ""
     
     try:
-        # Fetch data
+        # Fetch data with retries
         data = fetch_history_fast(stock_symbol)
         if data is None:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Failed to fetch data")
             return None
         
-        # Check required columns
-        if not all(c in data.columns for c in ('Close', 'Open', 'Volume')):
-            print(f"{prefix}{EMOJI_CROSS} {pretty}: Missing columns")
+        # Verify required columns exist
+        required_cols = ['Close', 'Open', 'Volume']
+        missing = [c for c in required_cols if c not in data.columns]
+        if missing:
+            print(f"{prefix}{EMOJI_CROSS} {pretty}: Missing columns: {missing}")
             return None
         
-        # Get last values
+        # Get last values with validation
         last_idx = -1
         close_price = get_value(data['Close'], last_idx)
         open_price = get_value(data['Open'], last_idx)
         volume = get_value(data['Volume'], last_idx)
         
-        if close_price is None or close_price <= 0:
-            print(f"{prefix}{EMOJI_CROSS} {pretty}: Invalid price")
+        # Strict validation for close price
+        if close_price is None:
+            print(f"{prefix}{EMOJI_CROSS} {pretty}: Close price is None")
             return None
+        
+        if close_price <= 0:
+            print(f"{prefix}{EMOJI_CROSS} {pretty}: Invalid close price {close_price}")
+            return None
+        
+        # If open price is missing, try previous day
+        if open_price is None or open_price <= 0:
+            open_price = get_value(data['Open'], -2)
         
         # Calculate all indicators at once
         indicators = calculate_indicators(data)
         
-        # Extract indicator values
-        rsi_val = get_value(indicators['rsi'], last_idx) or 50.0
-        macd_val = get_value(indicators['macd'], last_idx) or 0.0
-        macd_sig_val = get_value(indicators['macd_signal'], last_idx) or 0.0
-        bb_up_val = get_value(indicators['bb_upper'], last_idx) or close_price
-        bb_low_val = get_value(indicators['bb_lower'], last_idx) or close_price
+        # Extract indicator values with fallbacks
+        rsi_val = get_value(indicators['rsi'], last_idx)
+        if rsi_val is None:
+            rsi_val = 50.0 # Neutral RSI
+        
+        macd_val = get_value(indicators['macd'], last_idx)
+        if macd_val is None:
+            macd_val = 0.0
+        
+        macd_sig_val = get_value(indicators['macd_signal'], last_idx)
+        if macd_sig_val is None:
+            macd_sig_val = 0.0
+        
+        bb_up_val = get_value(indicators['bb_upper'], last_idx)
+        if bb_up_val is None:
+            bb_up_val = close_price * 1.02 # 2% above
+        
+        bb_low_val = get_value(indicators['bb_lower'], last_idx)
+        if bb_low_val is None:
+            bb_low_val = close_price * 0.98 # 2% below
+        
         vol_avg = get_value(indicators['vol_avg'], last_idx)
         
         # Fast voting logic
@@ -261,12 +312,17 @@ def generate_signal(stock_symbol, stock_num=0, total=0):
         else:
             votes.append('Hold')
         
-        # Volume vote
-        high_vol = (volume and vol_avg and volume > vol_avg)
-        votes.append(votes[-1] if high_vol else 'Hold')
+        # Volume vote (only if we have volume data)
+        if volume and vol_avg and volume > vol_avg:
+            votes.append(votes[-1]) # Amplify last signal
+        else:
+            votes.append('Hold')
         
-        # Price action vote
-        votes.append('Buy' if open_price and close_price > open_price else 'Sell')
+        # Price action vote (only if we have open price)
+        if open_price and open_price > 0:
+            votes.append('Buy' if close_price > open_price else 'Sell')
+        else:
+            votes.append('Hold')
         
         # Count votes
         buy_count = votes.count('Buy')
@@ -300,7 +356,7 @@ def generate_signal(stock_symbol, stock_num=0, total=0):
         return result
         
     except Exception as e:
-        logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: {e}")
+        logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: Unexpected error: {e}")
         return None
 
 def upload_batch(batch_data):
@@ -359,15 +415,41 @@ def main():
         batch = results[i:i+BATCH_SIZE]
         count = upload_batch(batch)
         uploaded += count
-        print(f"  {EMOJI_CHECK} Batch {i//BATCH_SIZE + 1}: {count}/{len(batch)} uploaded")
+        print(f" {EMOJI_CHECK} Batch {i//BATCH_SIZE + 1}: {count}/{len(batch)} uploaded")
     
-    # Save failed tickers
+    # Save failed tickers with categories
     if failed_tickers:
         try:
             with open('failed_tickers.txt', 'w') as fh:
+                fh.write("# Failed Tickers Report\n")
+                fh.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                
+                # Known delisted stocks
+                delisted = ['MM.NS', 'ABBANK.NS', 'MINDTREE.NS', 'LTI.NS', 
+                           'CADILAHC.NS', 'ZOMATO.NS', 'ADANIGAS.NS', 
+                           'ADANITRANS.NS', 'BERGER.NS', 'PHOENIX.NS']
+                
+                data_issues = []
+                truly_delisted = []
+                
                 for t in failed_tickers:
-                    fh.write(f"{t}\n")
-            logging.info(f"Wrote {len(failed_tickers)} failed tickers to file")
+                    if t in delisted:
+                        truly_delisted.append(t)
+                    else:
+                        data_issues.append(t)
+                
+                if truly_delisted:
+                    fh.write("## Delisted/Unavailable Stocks (can be removed from list):\n")
+                    for t in truly_delisted:
+                        fh.write(f"{t}\n")
+                    fh.write("\n")
+                
+                if data_issues:
+                    fh.write("## Temporary Data Issues (may work on retry):\n")
+                    for t in data_issues:
+                        fh.write(f"{t}\n")
+                
+            logging.info(f"Wrote {len(failed_tickers)} failed tickers ({len(truly_delisted)} delisted, {len(data_issues)} data issues)")
         except Exception as e:
             logging.error(f"Failed to write file: {e}")
     
@@ -376,12 +458,24 @@ def main():
     success = len(results)
     failed = len(failed_tickers)
     
+    # Categorize failures
+    delisted = ['MM.NS', 'ABBANK.NS', 'MINDTREE.NS', 'LTI.NS', 
+               'CADILAHC.NS', 'ZOMATO.NS', 'ADANIGAS.NS', 
+               'ADANITRANS.NS', 'BERGER.NS', 'PHOENIX.NS']
+    
+    truly_delisted = [t for t in failed_tickers if t in delisted]
+    data_issues = [t for t in failed_tickers if t not in delisted]
+    
     print()
     print("=" * 70)
     print(f"{EMOJI_CHART} SUMMARY")
     print("=" * 70)
     print(f"{EMOJI_CHECK} Successfully processed: {success} stocks")
     print(f"{EMOJI_CROSS} Failed: {failed} stocks")
+    if truly_delisted:
+        print(f" └─ Delisted/Unavailable: {len(truly_delisted)} stocks")
+    if data_issues:
+        print(f" └─ Temporary data issues: {len(data_issues)} stocks")
     print(f"⚡ Total time: {elapsed:.1f}s ({elapsed/len(STOCKS):.2f}s per stock)")
     print(f"⚡ Upload success rate: {uploaded}/{success} ({100*uploaded/max(success,1):.1f}%)")
     
