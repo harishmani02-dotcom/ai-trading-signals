@@ -466,21 +466,36 @@ def upload_batch(batch_data):
     try:
         valid_data = [d for d in batch_data if d and d.get('close_price', 0) > 0]
         if not valid_data:
+            print(f"{EMOJI_WARNING} No valid data in batch")
             return 0
+        
+        # Debug: Show first record
+        print(f"{EMOJI_ROCKET} Uploading {len(valid_data)} records. Sample:")
+        print(f"  {valid_data[0]}")
         
         resp = supabase.table('signals').upsert(
             valid_data,
             on_conflict='symbol,signal_date,signal_time'
         ).execute()
         
+        # Debug: Show response
+        print(f"{EMOJI_CHECK} Response type: {type(resp)}")
+        
         if isinstance(resp, dict) and resp.get('error'):
             logging.error(f"Batch upload error: {resp.get('error')}")
             return 0
+        
+        # Check if response has data
+        if hasattr(resp, 'data') and resp.data:
+            print(f"{EMOJI_CHECK} Successfully inserted {len(resp.data)} records")
+            return len(resp.data)
         
         return len(valid_data)
         
     except Exception as e:
         logging.error(f"Batch upload failed: {e}")
+        import traceback
+        traceback.print_exc()
         return 0
 
 # ================================================================
