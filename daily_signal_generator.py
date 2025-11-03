@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI TRADING SIGNALS - DAILY GENERATOR (PERFORMANCE OPTIMIZED)
-Automatically generates Buy/Sell/Hold signals for Indian stocks
+AI TRADING SIGNALS - INTRADAY GENERATOR (15-MIN INTERVALS)
+Generates Buy/Sell/Hold signals for Indian stocks during market hours
 """
 
 import os
@@ -11,14 +11,13 @@ import time
 import warnings
 import logging
 import re
-from random import uniform
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
 
 # Emoji constants
 EMOJI_ROBOT = "🤖"
@@ -36,22 +35,41 @@ EMOJI_CLOCK = "🕐"
 EMOJI_WARNING = "⚠️"
 EMOJI_ARROW = "→"
 EMOJI_ROCKET = "🚀"
+EMOJI_FIRE = "🔥"
+EMOJI_TARGET = "🎯"
 
 # ================================================================
 # CONFIGURATION
 # ================================================================
-
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 STOCK_LIST = os.getenv('STOCK_LIST', 'RELIANCE.NS,TCS.NS,INFY.NS')
 
-# Performance settings
-MAX_WORKERS = 10 # Parallel downloads
-BATCH_SIZE = 20 # Upload batch size
-RETRY_DELAY = 0.5 # Reduced from exponential backoff
-MAX_RETRIES = 3 # Increased to 3 for better success rate
+# Intraday settings
+INTERVAL = '15m'  # 15-minute candles
+INTRADAY_PERIOD = '5d'  # Last 5 days of intraday data
+MAX_WORKERS = 10
+BATCH_SIZE = 20
+RETRY_DELAY = 0.5
+MAX_RETRIES = 3
 
-# Basic logging
+# Market hours (IST)
+MARKET_OPEN = (9, 15)   # 9:15 AM
+MARKET_CLOSE = (15, 30)  # 3:30 PM
+
+# Intraday indicator periods (shorter for faster signals)
+RSI_PERIOD = 9       # Faster RSI
+MACD_FAST = 8
+MACD_SLOW = 17
+MACD_SIGNAL = 9
+BB_PERIOD = 15       # Bollinger Bands
+VOL_PERIOD = 10      # Volume average
+
+# Risk management
+STOP_LOSS_PCT = 1.5   # 1.5% stop loss
+TARGET_PCT = 2.5      # 2.5% target
+
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -62,7 +80,27 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     sys.exit(1)
 
 # ================================================================
-# SANITIZE / PARSE TICKER LIST
+# MARKET HOURS CHECK
+# ================================================================
+def is_market_hours():
+    """Check if current time is within market hours (IST)"""
+    now = datetime.now()
+    current_time = (now.hour, now.minute)
+    
+    # Check if it's a weekday (Monday=0, Sunday=6)
+    if now.weekday() > 4:
+        return False, "Market closed (Weekend)"
+    
+    # Check market hours
+    if current_time < MARKET_OPEN:
+        return False, f"Market opens at {MARKET_OPEN[0]:02d}:{MARKET_OPEN[1]:02d}"
+    elif current_time > MARKET_CLOSE:
+        return False, f"Market closed at {MARKET_CLOSE[0]:02d}:{MARKET_CLOSE[1]:02d}"
+    
+    return True, "Market is open"
+
+# ================================================================
+# SANITIZE TICKERS
 # ================================================================
 TICKER_RE = re.compile(r'^[A-Z0-9][A-Z0-9._-]{0,18}(?:\.[A-Z]{1,5})?$')
 
@@ -72,7 +110,7 @@ def sanitize_tickers(raw: str):
         t = str(part).strip()
         if not t:
             continue
-        t = t.strip(" '\"`;:()[]{}<>")
+        t = t.strip(" '\"`; :()[]{}<>")
         if not t:
             continue
         tokens = t.split()
@@ -84,7 +122,8 @@ def sanitize_tickers(raw: str):
             continue
         if TICKER_RE.match(t):
             items.append(t)
-    # Dedupe preserving order
+    
+    # Dedupe
     seen = set()
     out = []
     for t in items:
@@ -95,14 +134,18 @@ def sanitize_tickers(raw: str):
 
 STOCKS = sanitize_tickers(STOCK_LIST)
 
+# ================================================================
+# STARTUP INFO
+# ================================================================
 print("=" * 70)
-print(f"{EMOJI_ROBOT} AI TRADING SIGNALS - DAILY GENERATOR (OPTIMIZED)")
+print(f"{EMOJI_ROBOT} AI TRADING SIGNALS - INTRADAY GENERATOR ({INTERVAL})")
 print("=" * 70)
 print(f"{EMOJI_CAL} Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
 print(f"{EMOJI_CHART} Stocks to analyze: {len(STOCKS)}")
+print(f"{EMOJI_CHART} Interval: {INTERVAL} candles")
 print(f"{EMOJI_LINK} Supabase URL: {SUPABASE_URL[:30]}...")
-print(f"⚡ Max parallel workers: {MAX_WORKERS}")
-print(f"⚡ Batch upload size: {BATCH_SIZE}")
+print(f"⚡ Max workers: {MAX_WORKERS}")
+print(f"{EMOJI_TARGET} Stop Loss: {STOP_LOSS_PCT}% | Target: {TARGET_PCT}%")
 print("=" * 70)
 print()
 
@@ -119,101 +162,112 @@ except Exception as e:
     sys.exit(1)
 
 # ================================================================
-# OPTIMIZED HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # ================================================================
-
 def get_value(series, idx):
-    """Fast value extraction with better validation"""
+    """Extract value safely"""
     try:
         if series is None or len(series) == 0:
             return None
         
         val = series.iloc[idx]
         
-        # Handle Series within Series
         if isinstance(val, pd.Series):
             val = val.iloc[0] if len(val) > 0 else None
         
-        # Convert to float and validate
         if pd.isna(val):
             return None
         
         float_val = float(val)
         
-        # Additional validation: reject extremely small or negative prices
         if float_val <= 0 or float_val < 0.01:
             return None
-            
+        
         return float_val
     except (IndexError, ValueError, TypeError):
         return None
 
-def calculate_indicators(prices):
-    """Calculate all indicators at once to avoid multiple passes"""
+def calculate_intraday_indicators(prices):
+    """Calculate intraday technical indicators"""
     close = prices['Close']
+    high = prices['High']
+    low = prices['Low']
     
-    # RSI calculation
+    # Fast RSI for intraday
     delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(14).mean()
+    gain = delta.where(delta > 0, 0).rolling(RSI_PERIOD).mean()
+    loss = -delta.where(delta < 0, 0).rolling(RSI_PERIOD).mean()
     rs = gain / loss.replace(0, 0.0001)
     rsi = 100 - (100 / (1 + rs))
     
-    # MACD calculation
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    # Fast MACD
+    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    macd_histogram = macd - macd_signal
     
-    # Bollinger Bands
-    sma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    bb_upper = sma20 + (2 * std20)
-    bb_lower = sma20 - (2 * std20)
+    # Bollinger Bands (shorter period)
+    sma = close.rolling(BB_PERIOD).mean()
+    std = close.rolling(BB_PERIOD).std()
+    bb_upper = sma + (2 * std)
+    bb_lower = sma - (2 * std)
+    bb_middle = sma
     
-    # Volume average
-    vol_avg = prices['Volume'].rolling(20).mean()
+    # Volume
+    vol_avg = prices['Volume'].rolling(VOL_PERIOD).mean()
+    
+    # Moving averages for trend
+    ema_20 = close.ewm(span=20, adjust=False).mean()
+    ema_50 = close.ewm(span=50, adjust=False).mean()
+    
+    # ATR for volatility (intraday)
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
     
     return {
         'rsi': rsi,
         'macd': macd,
         'macd_signal': macd_signal,
+        'macd_histogram': macd_histogram,
         'bb_upper': bb_upper,
         'bb_lower': bb_lower,
-        'vol_avg': vol_avg
+        'bb_middle': bb_middle,
+        'vol_avg': vol_avg,
+        'ema_20': ema_20,
+        'ema_50': ema_50,
+        'atr': atr
     }
 
-def fetch_history_fast(ticker: str, max_retries=MAX_RETRIES):
-    """Optimized fetch with better error handling"""
+def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
+    """Fetch intraday data"""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
                 time.sleep(RETRY_DELAY)
             
-            # Create a new Ticker object each time to avoid stale sessions
             stock = yf.Ticker(ticker)
-            data = stock.history(period='3mo', auto_adjust=True)
+            data = stock.history(period=INTRADAY_PERIOD, interval=INTERVAL, auto_adjust=True)
             
-            # Handle MultiIndex columns
             if hasattr(data, "columns") and isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             
-            # Validate data
             if data is None or data.empty:
                 raise ValueError("Empty data")
             
             if len(data) < 30:
-                raise ValueError(f"Only {len(data)} rows")
+                raise ValueError(f"Only {len(data)} candles")
             
             if 'Close' not in data.columns:
                 raise ValueError("Missing Close column")
             
-            # Ensure we have valid close prices
             valid_closes = data['Close'].dropna()
             if len(valid_closes) < 30:
                 raise ValueError(f"Only {len(valid_closes)} valid closes")
             
-            # Check if last close price is valid
             last_close = data['Close'].iloc[-1]
             if pd.isna(last_close) or last_close <= 0:
                 raise ValueError(f"Invalid last close: {last_close}")
@@ -226,101 +280,122 @@ def fetch_history_fast(ticker: str, max_retries=MAX_RETRIES):
                 return None
     return None
 
-def generate_signal(stock_symbol, stock_num=0, total=0):
-    """Optimized signal generation with robust error handling"""
+def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
+    """Generate intraday trading signal"""
     pretty = stock_symbol.replace('.NS', '')
     prefix = f"[{stock_num}/{total}] " if total > 0 else ""
     
     try:
-        # Fetch data with retries
-        data = fetch_history_fast(stock_symbol)
+        # Fetch intraday data
+        data = fetch_intraday_data(stock_symbol)
         if data is None:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Failed to fetch data")
             return None
         
-        # Verify required columns exist
-        required_cols = ['Close', 'Open', 'Volume']
+        # Verify columns
+        required_cols = ['Close', 'Open', 'High', 'Low', 'Volume']
         missing = [c for c in required_cols if c not in data.columns]
         if missing:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Missing columns: {missing}")
             return None
         
-        # Get last values with validation
+        # Get current candle values
         last_idx = -1
         close_price = get_value(data['Close'], last_idx)
         open_price = get_value(data['Open'], last_idx)
+        high_price = get_value(data['High'], last_idx)
+        low_price = get_value(data['Low'], last_idx)
         volume = get_value(data['Volume'], last_idx)
         
-        # Strict validation for close price
-        if close_price is None:
-            print(f"{prefix}{EMOJI_CROSS} {pretty}: Close price is None")
+        if close_price is None or close_price <= 0:
+            print(f"{prefix}{EMOJI_CROSS} {pretty}: Invalid close price")
             return None
         
-        if close_price <= 0:
-            print(f"{prefix}{EMOJI_CROSS} {pretty}: Invalid close price {close_price}")
-            return None
+        # Calculate indicators
+        indicators = calculate_intraday_indicators(data)
         
-        # If open price is missing, try previous day
-        if open_price is None or open_price <= 0:
-            open_price = get_value(data['Open'], -2)
-        
-        # Calculate all indicators at once
-        indicators = calculate_indicators(data)
-        
-        # Extract indicator values with fallbacks
-        rsi_val = get_value(indicators['rsi'], last_idx)
-        if rsi_val is None:
-            rsi_val = 50.0 # Neutral RSI
-        
-        macd_val = get_value(indicators['macd'], last_idx)
-        if macd_val is None:
-            macd_val = 0.0
-        
-        macd_sig_val = get_value(indicators['macd_signal'], last_idx)
-        if macd_sig_val is None:
-            macd_sig_val = 0.0
-        
-        bb_up_val = get_value(indicators['bb_upper'], last_idx)
-        if bb_up_val is None:
-            bb_up_val = close_price * 1.02 # 2% above
-        
-        bb_low_val = get_value(indicators['bb_lower'], last_idx)
-        if bb_low_val is None:
-            bb_low_val = close_price * 0.98 # 2% below
-        
+        # Extract indicator values
+        rsi_val = get_value(indicators['rsi'], last_idx) or 50.0
+        macd_val = get_value(indicators['macd'], last_idx) or 0.0
+        macd_sig_val = get_value(indicators['macd_signal'], last_idx) or 0.0
+        macd_hist = get_value(indicators['macd_histogram'], last_idx) or 0.0
+        bb_up_val = get_value(indicators['bb_upper'], last_idx) or close_price * 1.02
+        bb_low_val = get_value(indicators['bb_lower'], last_idx) or close_price * 0.98
+        bb_mid_val = get_value(indicators['bb_middle'], last_idx) or close_price
         vol_avg = get_value(indicators['vol_avg'], last_idx)
+        ema_20 = get_value(indicators['ema_20'], last_idx) or close_price
+        ema_50 = get_value(indicators['ema_50'], last_idx) or close_price
+        atr_val = get_value(indicators['atr'], last_idx) or (close_price * 0.02)
         
-        # Fast voting logic
+        # INTRADAY SIGNAL LOGIC (More aggressive)
         votes = []
+        strength_score = 0
         
-        # RSI vote
-        if rsi_val < 30:
+        # 1. RSI - Oversold/Overbought (intraday thresholds)
+        if rsi_val < 35:
             votes.append('Buy')
-        elif rsi_val > 70:
+            strength_score += 2
+        elif rsi_val > 65:
             votes.append('Sell')
+            strength_score += 2
+        elif 45 <= rsi_val <= 55:
+            votes.append('Hold')
         else:
             votes.append('Hold')
+            strength_score += 1
         
-        # MACD vote
-        votes.append('Buy' if macd_val > macd_sig_val else 'Sell')
-        
-        # Bollinger vote
-        if close_price < bb_low_val:
+        # 2. MACD - Momentum
+        if macd_val > macd_sig_val and macd_hist > 0:
             votes.append('Buy')
-        elif close_price > bb_up_val:
+            strength_score += 2
+        elif macd_val < macd_sig_val and macd_hist < 0:
             votes.append('Sell')
+            strength_score += 2
         else:
             votes.append('Hold')
         
-        # Volume vote (only if we have volume data)
-        if volume and vol_avg and volume > vol_avg:
-            votes.append(votes[-1]) # Amplify last signal
+        # 3. Bollinger Bands - Mean reversion
+        bb_position = (close_price - bb_low_val) / (bb_up_val - bb_low_val) if bb_up_val != bb_low_val else 0.5
+        if bb_position < 0.2:  # Near lower band
+            votes.append('Buy')
+            strength_score += 1
+        elif bb_position > 0.8:  # Near upper band
+            votes.append('Sell')
+            strength_score += 1
         else:
             votes.append('Hold')
         
-        # Price action vote (only if we have open price)
-        if open_price and open_price > 0:
-            votes.append('Buy' if close_price > open_price else 'Sell')
+        # 4. EMA Crossover - Trend
+        if ema_20 > ema_50:
+            votes.append('Buy')
+            strength_score += 1
+        elif ema_20 < ema_50:
+            votes.append('Sell')
+            strength_score += 1
+        else:
+            votes.append('Hold')
+        
+        # 5. Volume confirmation
+        if volume and vol_avg and volume > vol_avg * 1.5:
+            votes.append(votes[-1])  # Amplify last signal
+            strength_score += 2
+        else:
+            votes.append('Hold')
+        
+        # 6. Price action (candle pattern)
+        candle_body = close_price - open_price
+        candle_range = high_price - low_price if high_price and low_price else 0
+        
+        if candle_range > 0:
+            body_ratio = abs(candle_body) / candle_range
+            if candle_body > 0 and body_ratio > 0.6:  # Strong bullish candle
+                votes.append('Buy')
+                strength_score += 1
+            elif candle_body < 0 and body_ratio > 0.6:  # Strong bearish candle
+                votes.append('Sell')
+                strength_score += 1
+            else:
+                votes.append('Hold')
         else:
             votes.append('Hold')
         
@@ -329,16 +404,34 @@ def generate_signal(stock_symbol, stock_num=0, total=0):
         sell_count = votes.count('Sell')
         hold_count = votes.count('Hold')
         
-        # Determine signal
-        if buy_count >= 3:
+        # Determine signal (need 4+ votes for action)
+        if buy_count >= 4:
             signal = 'Buy'
-            confidence = (buy_count / 5) * 100
-        elif sell_count >= 3:
+            confidence = min((buy_count / 6) * 100 + (strength_score * 2), 100)
+        elif sell_count >= 4:
             signal = 'Sell'
-            confidence = (sell_count / 5) * 100
+            confidence = min((sell_count / 6) * 100 + (strength_score * 2), 100)
         else:
             signal = 'Hold'
-            confidence = (max(buy_count, sell_count, hold_count) / 5) * 100
+            confidence = (max(buy_count, sell_count, hold_count) / 6) * 100
+        
+        # Calculate stop loss and target
+        if signal == 'Buy':
+            stop_loss = round(close_price * (1 - STOP_LOSS_PCT/100), 2)
+            target = round(close_price * (1 + TARGET_PCT/100), 2)
+        elif signal == 'Sell':
+            stop_loss = round(close_price * (1 + STOP_LOSS_PCT/100), 2)
+            target = round(close_price * (1 - TARGET_PCT/100), 2)
+        else:
+            stop_loss = None
+            target = None
+        
+        # Risk-reward ratio
+        risk_reward = None
+        if stop_loss and target:
+            risk = abs(close_price - stop_loss)
+            reward = abs(target - close_price)
+            risk_reward = round(reward / risk, 2) if risk > 0 else None
         
         result = {
             'symbol': pretty,
@@ -346,21 +439,30 @@ def generate_signal(stock_symbol, stock_num=0, total=0):
             'confidence': round(float(confidence), 1),
             'close_price': round(float(close_price), 2),
             'rsi': round(float(rsi_val), 1),
+            'macd': round(float(macd_val), 3),
+            'stop_loss': stop_loss,
+            'target': target,
+            'risk_reward': risk_reward,
             'buy_votes': int(buy_count),
             'sell_votes': int(sell_count),
             'hold_votes': int(hold_count),
-            'signal_date': datetime.now().date().isoformat()
+            'signal_date': datetime.now().date().isoformat(),
+            'signal_time': datetime.now().strftime('%H:%M:%S'),
+            'interval': INTERVAL
         }
         
-        print(f"{prefix}{EMOJI_CHECK} {pretty}: {signal} ({confidence:.0f}%) @ {EMOJI_RUPEE}{close_price:.2f}")
+        emoji = EMOJI_GREEN if signal == 'Buy' else EMOJI_RED if signal == 'Sell' else EMOJI_WHITE
+        sl_info = f"SL:{EMOJI_RUPEE}{stop_loss} T:{EMOJI_RUPEE}{target}" if stop_loss and target else ""
+        print(f"{prefix}{emoji} {pretty}: {signal} ({confidence:.0f}%) @ {EMOJI_RUPEE}{close_price:.2f} {sl_info}")
+        
         return result
         
     except Exception as e:
-        logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: Unexpected error: {e}")
+        logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: Error: {e}")
         return None
 
 def upload_batch(batch_data):
-    """Upload multiple signals at once"""
+    """Upload signals in batch"""
     try:
         valid_data = [d for d in batch_data if d and d.get('close_price', 0) > 0]
         if not valid_data:
@@ -368,7 +470,7 @@ def upload_batch(batch_data):
         
         resp = supabase.table('signals').upsert(
             valid_data,
-            on_conflict='symbol,signal_date'
+            on_conflict='symbol,signal_date,signal_time'
         ).execute()
         
         if isinstance(resp, dict) and resp.get('error'):
@@ -381,17 +483,20 @@ def upload_batch(batch_data):
         logging.error(f"Batch upload failed: {e}")
         return 0
 
+# ================================================================
+# MAIN
+# ================================================================
 def main():
-    print(f"{EMOJI_ROCKET} Starting parallel signal generation...\n")
+    print(f"{EMOJI_ROCKET} Starting intraday signal generation...\n")
     
     start_time = time.time()
     results = []
     failed_tickers = []
     
-    # Process stocks in parallel
+    # Process in parallel
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_stock = {
-            executor.submit(generate_signal, stock, i+1, len(STOCKS)): stock 
+            executor.submit(generate_intraday_signal, stock, i+1, len(STOCKS)): stock
             for i, stock in enumerate(STOCKS)
         }
         
@@ -407,8 +512,8 @@ def main():
                 logging.error(f"Error processing {stock}: {e}")
                 failed_tickers.append(stock)
     
-    # Batch upload results
-    print(f"\n{EMOJI_ROCKET} Uploading {len(results)} signals in batches...")
+    # Batch upload
+    print(f"\n{EMOJI_ROCKET} Uploading {len(results)} signals...")
     uploaded = 0
     
     for i in range(0, len(results), BATCH_SIZE):
@@ -417,91 +522,48 @@ def main():
         uploaded += count
         print(f" {EMOJI_CHECK} Batch {i//BATCH_SIZE + 1}: {count}/{len(batch)} uploaded")
     
-    # Save failed tickers with categories
-    if failed_tickers:
-        try:
-            with open('failed_tickers.txt', 'w') as fh:
-                fh.write("# Failed Tickers Report\n")
-                fh.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                
-                # Known delisted stocks
-                delisted = ['MM.NS', 'ABBANK.NS', 'MINDTREE.NS', 'LTI.NS', 
-                           'CADILAHC.NS', 'ZOMATO.NS', 'ADANIGAS.NS', 
-                           'ADANITRANS.NS', 'BERGER.NS', 'PHOENIX.NS']
-                
-                data_issues = []
-                truly_delisted = []
-                
-                for t in failed_tickers:
-                    if t in delisted:
-                        truly_delisted.append(t)
-                    else:
-                        data_issues.append(t)
-                
-                if truly_delisted:
-                    fh.write("## Delisted/Unavailable Stocks (can be removed from list):\n")
-                    for t in truly_delisted:
-                        fh.write(f"{t}\n")
-                    fh.write("\n")
-                
-                if data_issues:
-                    fh.write("## Temporary Data Issues (may work on retry):\n")
-                    for t in data_issues:
-                        fh.write(f"{t}\n")
-                
-            logging.info(f"Wrote {len(failed_tickers)} failed tickers ({len(truly_delisted)} delisted, {len(data_issues)} data issues)")
-        except Exception as e:
-            logging.error(f"Failed to write file: {e}")
-    
     # Summary
     elapsed = time.time() - start_time
     success = len(results)
     failed = len(failed_tickers)
     
-    # Categorize failures
-    delisted = ['MM.NS', 'ABBANK.NS', 'MINDTREE.NS', 'LTI.NS', 
-               'CADILAHC.NS', 'ZOMATO.NS', 'ADANIGAS.NS', 
-               'ADANITRANS.NS', 'BERGER.NS', 'PHOENIX.NS']
-    
-    truly_delisted = [t for t in failed_tickers if t in delisted]
-    data_issues = [t for t in failed_tickers if t not in delisted]
-    
     print()
     print("=" * 70)
-    print(f"{EMOJI_CHART} SUMMARY")
+    print(f"{EMOJI_CHART} INTRADAY SUMMARY")
     print("=" * 70)
     print(f"{EMOJI_CHECK} Successfully processed: {success} stocks")
     print(f"{EMOJI_CROSS} Failed: {failed} stocks")
-    if truly_delisted:
-        print(f" └─ Delisted/Unavailable: {len(truly_delisted)} stocks")
-    if data_issues:
-        print(f" └─ Temporary data issues: {len(data_issues)} stocks")
     print(f"⚡ Total time: {elapsed:.1f}s ({elapsed/len(STOCKS):.2f}s per stock)")
-    print(f"⚡ Upload success rate: {uploaded}/{success} ({100*uploaded/max(success,1):.1f}%)")
+    print(f"⚡ Upload rate: {uploaded}/{success} ({100*uploaded/max(success,1):.1f}%)")
     
     if results:
         df = pd.DataFrame(results)
         
-        # Check for zero prices
-        zero_prices = df[df['close_price'] == 0]
-        if len(zero_prices) > 0:
-            print(f"\n{EMOJI_WARNING} WARNING: {len(zero_prices)} stocks have zero price!")
+        buy_signals = df[df['signal'] == 'Buy']
+        sell_signals = df[df['signal'] == 'Sell']
+        hold_signals = df[df['signal'] == 'Hold']
         
         print()
-        print(f"{EMOJI_GREEN} Buy signals: {len(df[df['signal'] == 'Buy'])}")
-        print(f"{EMOJI_RED} Sell signals: {len(df[df['signal'] == 'Sell'])}")
-        print(f"{EMOJI_WHITE} Hold signals: {len(df[df['signal'] == 'Hold'])}")
+        print(f"{EMOJI_GREEN} Buy signals: {len(buy_signals)}")
+        print(f"{EMOJI_RED} Sell signals: {len(sell_signals)}")
+        print(f"{EMOJI_WHITE} Hold signals: {len(hold_signals)}")
         print(f"{EMOJI_CHART} Average confidence: {df['confidence'].mean():.1f}%")
-        print(f"{EMOJI_MONEY} Average price: {EMOJI_RUPEE}{df['close_price'].mean():.2f}")
         
-        print(f"\n{EMOJI_MONEY} TOP 3 SIGNALS:")
-        for _, row in df.nlargest(3, 'confidence').iterrows():
-            emoji = EMOJI_GREEN if row['signal'] == 'Buy' else EMOJI_RED if row['signal'] == 'Sell' else EMOJI_WHITE
-            print(f" {emoji} {row['symbol']:12s} {row['signal']:5s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f}")
+        if len(buy_signals) > 0:
+            print(f"\n{EMOJI_FIRE} TOP 3 BUY SIGNALS:")
+            for _, row in buy_signals.nlargest(3, 'confidence').iterrows():
+                rr = f"R:R {row['risk_reward']}" if row['risk_reward'] else ""
+                print(f" {EMOJI_GREEN} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
+        
+        if len(sell_signals) > 0:
+            print(f"\n{EMOJI_FIRE} TOP 3 SELL SIGNALS:")
+            for _, row in sell_signals.nlargest(3, 'confidence').iterrows():
+                rr = f"R:R {row['risk_reward']}" if row['risk_reward'] else ""
+                print(f" {EMOJI_RED} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
     
     print()
     print("=" * 70)
-    print(f"{EMOJI_CHECK} DAILY SIGNAL GENERATION COMPLETE!")
+    print(f"{EMOJI_CHECK} INTRADAY SIGNAL GENERATION COMPLETE!")
     print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
     print("=" * 70)
     
