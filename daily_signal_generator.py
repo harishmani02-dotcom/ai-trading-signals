@@ -574,7 +574,7 @@ def main():
             print(f"\n{EMOJI_FIRE} TOP 3 SELL SIGNALS:")
             for _, row in sell_signals.nlargest(3, 'confidence').iterrows():
                 rr = f"R:R {row['risk_reward']}" if row['risk_reward'] else ""
-                 print(f" {EMOJI_RED} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
+                print(f" {EMOJI_RED} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
     
     print()
     print("=" * 70)
