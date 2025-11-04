@@ -356,10 +356,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         # 3. Bollinger Bands - Mean reversion
         bb_position = (close_price - bb_low_val) / (bb_up_val - bb_low_val) if bb_up_val != bb_low_val else 0.5
-        if bb_position < 0.2:
+        if bb_position < 0.2:  # Near lower band
             votes.append('Buy')
             strength_score += 1
-        elif bb_position > 0.8:
+        elif bb_position > 0.8:  # Near upper band
             votes.append('Sell')
             strength_score += 1
         else:
@@ -377,7 +377,7 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         # 5. Volume confirmation
         if volume and vol_avg and volume > vol_avg * 1.5:
-            votes.append(votes[-1])
+            votes.append(votes[-1])  # Amplify last signal
             strength_score += 2
         else:
             votes.append('Hold')
@@ -388,10 +388,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         if candle_range > 0:
             body_ratio = abs(candle_body) / candle_range
-            if candle_body > 0 and body_ratio > 0.6:
+            if candle_body > 0 and body_ratio > 0.6:  # Strong bullish candle
                 votes.append('Buy')
                 strength_score += 1
-            elif candle_body < 0 and body_ratio > 0.6:
+            elif candle_body < 0 and body_ratio > 0.6:  # Strong bearish candle
                 votes.append('Sell')
                 strength_score += 1
             else:
