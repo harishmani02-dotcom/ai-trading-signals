@@ -46,28 +46,28 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 STOCK_LIST = os.getenv('STOCK_LIST', 'RELIANCE.NS,TCS.NS,INFY.NS')
 
 # Intraday settings
-INTERVAL = '15m'  # 15-minute candles
-INTRADAY_PERIOD = '5d'  # Last 5 days of intraday data
+INTERVAL = '15m' # 15-minute candles
+INTRADAY_PERIOD = '5d' # Last 5 days of intraday data
 MAX_WORKERS = 10
 BATCH_SIZE = 20
 RETRY_DELAY = 0.5
 MAX_RETRIES = 3
 
 # Market hours (IST)
-MARKET_OPEN = (9, 15)   # 9:15 AM
-MARKET_CLOSE = (15, 30)  # 3:30 PM
+MARKET_OPEN = (9, 15) # 9:15 AM
+MARKET_CLOSE = (15, 30) # 3:30 PM
 
 # Intraday indicator periods (shorter for faster signals)
-RSI_PERIOD = 9       # Faster RSI
+RSI_PERIOD = 9 # Faster RSI
 MACD_FAST = 8
 MACD_SLOW = 17
 MACD_SIGNAL = 9
-BB_PERIOD = 15       # Bollinger Bands
-VOL_PERIOD = 10      # Volume average
+BB_PERIOD = 15 # Bollinger Bands
+VOL_PERIOD = 10 # Volume average
 
 # Risk management
-STOP_LOSS_PCT = 1.5   # 1.5% stop loss
-TARGET_PCT = 2.5      # 2.5% target
+STOP_LOSS_PCT = 1.5 # 1.5% stop loss
+TARGET_PCT = 2.5 # 2.5% target
 
 # Logging
 logging.basicConfig(
@@ -356,10 +356,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         # 3. Bollinger Bands - Mean reversion
         bb_position = (close_price - bb_low_val) / (bb_up_val - bb_low_val) if bb_up_val != bb_low_val else 0.5
-        if bb_position < 0.2:  # Near lower band
+        if bb_position < 0.2:
             votes.append('Buy')
             strength_score += 1
-        elif bb_position > 0.8:  # Near upper band
+        elif bb_position > 0.8:
             votes.append('Sell')
             strength_score += 1
         else:
@@ -377,7 +377,7 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         # 5. Volume confirmation
         if volume and vol_avg and volume > vol_avg * 1.5:
-            votes.append(votes[-1])  # Amplify last signal
+            votes.append(votes[-1])
             strength_score += 2
         else:
             votes.append('Hold')
@@ -388,10 +388,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         if candle_range > 0:
             body_ratio = abs(candle_body) / candle_range
-            if candle_body > 0 and body_ratio > 0.6:  # Strong bullish candle
+            if candle_body > 0 and body_ratio > 0.6:
                 votes.append('Buy')
                 strength_score += 1
-            elif candle_body < 0 and body_ratio > 0.6:  # Strong bearish candle
+            elif candle_body < 0 and body_ratio > 0.6:
                 votes.append('Sell')
                 strength_score += 1
             else:
@@ -471,7 +471,7 @@ def upload_batch(batch_data):
         
         # Debug: Show first record
         print(f"{EMOJI_ROCKET} Uploading {len(valid_data)} records. Sample:")
-        print(f"  {valid_data[0]}")
+        print(f" {valid_data[0]}")
         
         # Use insert instead of upsert (simpler, no constraint needed)
         resp = supabase.table('signals').insert(
@@ -503,6 +503,22 @@ def upload_batch(batch_data):
 # ================================================================
 def main():
     print(f"{EMOJI_ROCKET} Starting intraday signal generation...\n")
+    
+    # Delete today's old signals first to avoid duplicates
+    try:
+        today = datetime.now().date().isoformat()
+        print(f"{EMOJI_WARNING} Deleting today's old signals (date: {today})...")
+        
+        delete_resp = supabase.table('signals').delete().eq('signal_date', today).execute()
+        
+        if hasattr(delete_resp, 'data'):
+            deleted_count = len(delete_resp.data) if delete_resp.data else 0
+            print(f"{EMOJI_CHECK} Deleted {deleted_count} old signals\n")
+        else:
+            print(f"{EMOJI_CHECK} Old signals cleared\n")
+    except Exception as e:
+        print(f"{EMOJI_WARNING} Could not delete old signals: {e}")
+        print(f"{EMOJI_WARNING} Continuing anyway...\n")
     
     start_time = time.time()
     results = []
