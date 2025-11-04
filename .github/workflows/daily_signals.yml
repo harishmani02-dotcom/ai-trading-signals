@@ -1,135 +1,82 @@
 # ================================================================
-# AI TRADING SIGNALS - GITHUB ACTIONS WORKFLOW (INTRADAY)
-# Runs every 15 minutes during market hours (9 AM - 3:30 PM IST)
-# IST = UTC + 5:30, so 9 AM IST = 3:30 AM UTC, 3:30 PM IST = 10 AM UTC
+# AI TRADING SIGNALS - INTRADAY (Every 15 minutes during market hours)
+# Runs: 9:00 AM - 3:30 PM IST on weekdays
 # ================================================================
 
 name: Intraday Signal Generator
 
-# When to run this workflow
 on:
-  # Schedule: Every 15 minutes from 3:30 AM to 10:00 AM UTC (9:00 AM to 3:30 PM IST)
-  # Runs on weekdays only (Monday-Friday)
+  # Every 15 minutes during market hours (3:30 AM - 10:00 AM UTC = 9:00 AM - 3:30 PM IST)
   schedule:
-    # 9:00 AM IST = 3:30 AM UTC
+    # 9:00-9:45 AM IST
     - cron: '30 3 * * 1-5'
     - cron: '45 3 * * 1-5'
-    
-    # 10:00 AM IST = 4:30 AM UTC
+    # 10:00-10:45 AM IST
     - cron: '0 4 * * 1-5'
     - cron: '15 4 * * 1-5'
     - cron: '30 4 * * 1-5'
     - cron: '45 4 * * 1-5'
-    
-    # 11:00 AM IST = 5:30 AM UTC
+    # 11:00-11:45 AM IST
     - cron: '0 5 * * 1-5'
     - cron: '15 5 * * 1-5'
     - cron: '30 5 * * 1-5'
     - cron: '45 5 * * 1-5'
-    
-    # 12:00 PM IST = 6:30 AM UTC
+    # 12:00-12:45 PM IST
     - cron: '0 6 * * 1-5'
     - cron: '15 6 * * 1-5'
     - cron: '30 6 * * 1-5'
     - cron: '45 6 * * 1-5'
-    
-    # 1:00 PM IST = 7:30 AM UTC
+    # 1:00-1:45 PM IST
     - cron: '0 7 * * 1-5'
     - cron: '15 7 * * 1-5'
     - cron: '30 7 * * 1-5'
     - cron: '45 7 * * 1-5'
-    
-    # 2:00 PM IST = 8:30 AM UTC
+    # 2:00-2:45 PM IST
     - cron: '0 8 * * 1-5'
     - cron: '15 8 * * 1-5'
     - cron: '30 8 * * 1-5'
     - cron: '45 8 * * 1-5'
-    
-    # 3:00 PM IST = 9:30 AM UTC
+    # 3:00-3:30 PM IST
     - cron: '0 9 * * 1-5'
     - cron: '15 9 * * 1-5'
-    - cron: '30 9 * * 1-5'  # 3:30 PM IST (market close)
+    - cron: '30 9 * * 1-5'
   
-  # Allow manual trigger (for testing)
   workflow_dispatch:
 
-# Prevent multiple instances from running simultaneously
 concurrency:
   group: intraday-signals
   cancel-in-progress: true
 
-# Define the job
 jobs:
   generate-signals:
     runs-on: ubuntu-latest
     
     steps:
-      # Step 1: Get the code from repository
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v3
       
-      # Step 2: Install Python
-      - name: Setup Python 3.10
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          cache: 'pip'  # Cache pip packages for faster runs
+          cache: 'pip'
       
-      # Step 3: Install required Python packages
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install yfinance "pandas<2.3.0" numpy supabase
+          pip install --upgrade pip
+          pip install yfinance pandas numpy supabase
       
-      # Step 4: Run the intraday signal generator
-      - name: Generate intraday signals
+      - name: Run intraday signals
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           STOCK_LIST: ${{ secrets.STOCK_LIST }}
-        run: |
-          python intraday_signals.py
+        run: python intraday_signals.py
       
-      # Step 5: Upload logs (optional, for debugging)
-      - name: Upload execution logs
+      - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: intraday-logs-${{ github.run_number }}
-          path: |
-            *.log
-            *.txt
+          name: logs
+          path: '*.log'
           retention-days: 3
-
-# ================================================================
-# CONFIGURATION NOTES:
-# 
-# SCHEDULE:
-# - Runs every 15 minutes during market hours (9:00 AM - 3:30 PM IST)
-# - Only on weekdays (Monday-Friday, represented as 1-5)
-# - IST = UTC + 5:30
-# - Total: 27 runs per day (6.5 hours × 4 runs/hour)
-#
-# MARKET HOURS:
-# - 9:00 AM IST (3:30 AM UTC) - Market opens at 9:15 AM
-# - 3:30 PM IST (10:00 AM UTC) - Market closes at 3:30 PM
-# - Script includes 15 min buffer before market opens
-#
-# CONCURRENCY:
-# - Only one instance runs at a time
-# - If a run takes longer than 15 min, the next is cancelled
-#
-# PERFORMANCE:
-# - Uses pip cache for faster dependency installation
-# - Keeps logs for 3 days (shorter than daily version)
-#
-# To test manually:
-# 1. Go to Actions tab
-# 2. Click "Intraday Signal Generator"
-# 3. Click "Run workflow"
-#
-# To adjust timing:
-# - Each cron line = one execution
-# - Format: 'minute hour day month day-of-week'
-# - 1-5 = Monday to Friday
-# ================================================================
