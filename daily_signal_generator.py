@@ -356,10 +356,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         # 3. Bollinger Bands - Mean reversion
         bb_position = (close_price - bb_low_val) / (bb_up_val - bb_low_val) if bb_up_val != bb_low_val else 0.5
-        if bb_position < 0.2:  # Near lower band
+        if bb_position < 0.2:
             votes.append('Buy')
             strength_score += 1
-        elif bb_position > 0.8:  # Near upper band
+        elif bb_position > 0.8:
             votes.append('Sell')
             strength_score += 1
         else:
@@ -377,7 +377,7 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         # 5. Volume confirmation
         if volume and vol_avg and volume > vol_avg * 1.5:
-            votes.append(votes[-1])  # Amplify last signal
+            votes.append(votes[-1])
             strength_score += 2
         else:
             votes.append('Hold')
@@ -388,10 +388,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         
         if candle_range > 0:
             body_ratio = abs(candle_body) / candle_range
-            if candle_body > 0 and body_ratio > 0.6:  # Strong bullish candle
+            if candle_body > 0 and body_ratio > 0.6:
                 votes.append('Buy')
                 strength_score += 1
-            elif candle_body < 0 and body_ratio > 0.6:  # Strong bearish candle
+            elif candle_body < 0 and body_ratio > 0.6:
                 votes.append('Sell')
                 strength_score += 1
             else:
@@ -574,7 +574,7 @@ def main():
             print(f"\n{EMOJI_FIRE} TOP 3 SELL SIGNALS:")
             for _, row in sell_signals.nlargest(3, 'confidence').iterrows():
                 rr = f"R:R {row['risk_reward']}" if row['risk_reward'] else ""
-          print(f" {EMOJI_RED} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
+                 print(f" {EMOJI_RED} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
     
     print()
     print("=" * 70)
