@@ -45,7 +45,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          cache: 'pip'
+          # cache removed to avoid failure when no requirements/pyproject exists
 
       - name: Install dependencies
         run: |
