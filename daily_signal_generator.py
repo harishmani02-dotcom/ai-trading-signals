@@ -19,6 +19,10 @@ warnings.filterwarnings('ignore')
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import pytz
+
+# Define IST Timezone
+IST_TZ = pytz.timezone('Asia/Kolkata')
 
 # Emoji constants
 EMOJI_ROBOT = "🤖"
@@ -83,10 +87,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     sys.exit(1)
 
 # ================================================================
-# MARKET HOURS CHECK
+# MARKET HOURS CHECK (NOW USES IST_TZ)
 # ================================================================
 def is_market_hours():
-    now = datetime.now()
+    now = datetime.now(IST_TZ)
     current_time = (now.hour, now.minute)
     if now.weekday() > 4:
         return False, "Market closed (Weekend)"
@@ -97,7 +101,7 @@ def is_market_hours():
     return True, "Market is open"
 
 def should_trade_now():
-    now = datetime.now()
+    now = datetime.now(IST_TZ)
     current_mins = now.hour * 60 + now.minute
     market_open_mins = MARKET_OPEN[0] * 60 + MARKET_OPEN[1]
     market_close_mins = MARKET_CLOSE[0] * 60 + MARKET_CLOSE[1]
@@ -141,7 +145,7 @@ STOCKS = sanitize_tickers(STOCK_LIST)
 print("=" * 70)
 print(f"{EMOJI_ROBOT} AI TRADING SIGNALS - INTRADAY GENERATOR v2.0 (IMPROVED)")
 print("=" * 70)
-print(f"{EMOJI_CAL} Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
+print(f"{EMOJI_CAL} Date: {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 print(f"{EMOJI_CHART} Stocks to analyze: {len(STOCKS)}")
 print(f"{EMOJI_CHART} Interval: {INTERVAL} candles")
 print(f"{EMOJI_LINK} Supabase URL: {SUPABASE_URL[:30]}...")
@@ -189,22 +193,31 @@ def get_value(series, idx):
         return None
 
 def validate_data_quality(data):
-    """FIXED: Relaxed data quality validation"""
+    """FIXED: Uses timezone-aware timestamps for staleness check."""
     if len(data) < 30:
         return False, f"Insufficient data ({len(data)} candles)"
     
+    # Ensure data index is timezone-aware for comparison
+    data_index = data.index
+    if data_index.tz is None:
+        # yfinance should return aware data, but if it doesn't, localize it
+        data_index = data_index.tz_localize(IST_TZ)
+        data.index = data_index
+    
     if len(data) > 1:
-        time_diff = data.index.to_series().diff()
+        time_diff = data_index.to_series().diff()
         expected_diff = pd.Timedelta(minutes=15)
         gaps = (time_diff > expected_diff * 5).sum()
         if gaps > 10:
             return False, f"Too many data gaps ({gaps})"
     
-    last_time = data.index[-1]
-    if hasattr(last_time, 'tz_localize'):
-        last_time = last_time.tz_localize(None) if last_time.tz is None else last_time
-    now = pd.Timestamp.now()
-    staleness_mins = (now - last_time).total_seconds() / 60
+    last_time = data_index[-1]
+    
+    # Use timezone-aware 'now' for comparison
+    now_aware = pd.Timestamp.now(IST_TZ)
+    
+    # Calculate difference between two timezone-aware objects
+    staleness_mins = (now_aware - last_time).total_seconds() / 60
     if staleness_mins > 1440:
         return False, f"Stale data ({staleness_mins:.0f} min old)"
     
@@ -264,13 +277,14 @@ def calculate_intraday_indicators(prices):
     }
 
 def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
-    """FIXED: Reduced minimum candle requirement to 30"""
+    """Fetches data and ensures the index is timezone-aware."""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
                 time.sleep(RETRY_DELAY)
             
             stock = yf.Ticker(ticker)
+            # yfinance returns timezone-aware data (typically UTC, but localized by the exchange)
             data = stock.history(period=INTRADAY_PERIOD, interval=INTERVAL, auto_adjust=True)
             
             if hasattr(data, "columns") and isinstance(data.columns, pd.MultiIndex):
@@ -293,12 +307,21 @@ def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
             if pd.isna(last_close) or last_close <= 0:
                 raise ValueError(f"Invalid last close: {last_close}")
             
+            # Ensure index is in IST for consistent logging/storage, converting from whatever yfinance gave
+            if data.index.tz is not None:
+                data.index = data.index.tz_convert(IST_TZ)
+            else:
+                # Fallback, should not happen with yfinance, but localizes to IST if naive
+                data.index = data.index.tz_localize(IST_TZ)
+
             return data
             
         except Exception as e:
             if attempt == max_retries:
-                logging.debug(f"Failed {ticker} after {max_retries} attempts: {e}")
+                logging.error(f"Failed {ticker} after {max_retries} attempts: {e}")
                 return None
+            else:
+                logging.debug(f"Attempt {attempt} failed for {ticker}: {e}")
     return None
 
 def determine_trend(ema_20, ema_50, close_price):
@@ -502,6 +525,8 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             reward = abs(target - close_price)
             risk_reward = round(reward / risk, 2) if risk > 0 else None
         
+        now_ist = datetime.now(IST_TZ)
+        
         result = {
             'symbol': pretty,
             'signal': signal,
@@ -515,8 +540,9 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             'buy_votes': int(buy_count),
             'sell_votes': int(sell_count),
             'hold_votes': int(hold_count),
-            'signal_date': datetime.now().date().isoformat(),
-            'signal_time': datetime.now().strftime('%H:%M:%S'),
+            # FIXED: Use timezone-aware 'now' for date/time fields
+            'signal_date': now_ist.date().isoformat(),
+            'signal_time': now_ist.strftime('%H:%M:%S'),
             'interval': INTERVAL
         }
         
@@ -530,7 +556,12 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         return result
         
     except Exception as e:
-        logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: Error: {e}")
+        # Catch specific yfinance delisted/404 errors and log them as INFO/WARNING
+        error_msg = str(e)
+        if "No data found, symbol may be delisted" in error_msg or "Quote not found" in error_msg:
+             logging.warning(f"{prefix}{EMOJI_WARNING} {pretty}: Data fetching failed (Delisted/404)")
+        else:
+            logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: Error: {e}")
         return None
 
 def upload_batch(batch_data):
@@ -559,13 +590,16 @@ def main():
     print(f"{EMOJI_ROCKET} Starting improved intraday signal generation...\n")
     
     try:
-        today = datetime.now().date().isoformat()
+        # FIXED: Use timezone-aware 'now'
+        today = datetime.now(IST_TZ).date().isoformat()
         print(f"{EMOJI_WARNING} Deleting today's old signals (date: {today})...")
         delete_resp = supabase.table('signals').delete().eq('signal_date', today).execute()
         
         if hasattr(delete_resp, 'data'):
-            deleted_count = len(delete_resp.data) if delete_resp.data else 0
-            print(f"{EMOJI_CHECK} Deleted {deleted_count} old signals\n")
+            # The 'delete' response usually just confirms the action, data might be None or empty list
+            # A successful delete HTTP code (204 or 200) usually means it worked.
+            # Logging the HTTP status here would be better, but sticking to existing format:
+            print(f"{EMOJI_CHECK} Old signals cleared (Checked against date: {today})\n")
         else:
             print(f"{EMOJI_CHECK} Old signals cleared\n")
     except Exception as e:
@@ -612,7 +646,7 @@ def main():
     print("=" * 70)
     print(f"{EMOJI_CHECK} Successfully processed: {success} stocks")
     print(f"{EMOJI_CROSS} Failed: {failed} stocks")
-    print(f"⚡ Total time: {elapsed:.1f}s ({elapsed/len(STOCKS):.2f}s per stock)")
+    print(f"⚡ Total time: {elapsed:.1f}s ({elapsed/len(STOCKS) if len(STOCKS) > 0 else 0:.2f}s per stock)")
     print(f"⚡ Upload rate: {uploaded}/{success} ({100*uploaded/max(success,1):.1f}%)")
     
     if results:
@@ -665,7 +699,8 @@ def main():
     print()
     print("=" * 70)
     print(f"{EMOJI_CHECK} IMPROVED INTRADAY SIGNAL GENERATION COMPLETE!")
-    print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
+    # FIXED: Use timezone-aware 'now'
+    print(f"{EMOJI_CLOCK} Completed at: {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"📝 Improvements: Better trend filtering, stricter vote requirements,")
     print(f" data quality validation, realistic confidence caps")
     print("=" * 70)
@@ -673,4 +708,11 @@ def main():
     sys.exit(0 if success > 0 else 1)
 
 if __name__ == "__main__":
+    # Check if pytz is available
+    try:
+        import pytz
+    except ImportError:
+        print(f"{EMOJI_CROSS} ERROR: The 'pytz' library is required for timezone handling. Please install it using 'pip install pytz'")
+        sys.exit(1)
+        
     main()
