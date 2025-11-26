@@ -590,4 +590,11 @@ def main():
     print()
     print("=" * 70)
     print(f"{EMOJI_CHECK} IMPROVED INTRADAY SIGNAL GENERATION COMPLETE!")
-    print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}") print(f"📝 Improvements: Better trend filtering, stricter vote requirements,") print(f"   data quality validation, realistic confidence caps") print("=" * 70) sys.exit(0 if success > 0 else 1)if name == "main": main()
+    print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print(f"📝 Improvements: Better trend filtering, stricter vote requirements,")
+    print(f"   data quality validation, realistic confidence caps")
+    print("=" * 70)
+    sys.exit(0 if success > 0 else 1)
+
+if __name__ == "__main__":
+    main()
