@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Finspark AI — v6.2 PRODUCTION (CTO-Approved)
-- Fixed all 8 critical issues from v6.1
-- Zero duplicates, correct schema mapping, optimized runtime
-- Safe for GitHub Actions deployment
+Finspark AI — v6.2.1 HOTFIX (Production Ready)
+- Fixed Yahoo Finance API boolean parameter issue
+- All v6.2 improvements + critical bug fix
+- Ready for immediate deployment
 """
 import os
 import sys
@@ -59,10 +59,11 @@ TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "2.4"))
 MIN_CANDLE_COUNT = int(os.getenv("MIN_CANDLE_COUNT", "100"))
 MAX_CIRCUIT_PCT = float(os.getenv("MAX_CIRCUIT_PCT", "0.18"))
 
-# Logging
+# Logging - define START_TS at top (stylistic improvement)
+START_TS = time.time()
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-logger = logging.getLogger("FinsparkV6.2")
+logger = logging.getLogger("FinsparkV6.2.1")
 
 def json_log(event_type: str, payload: dict):
     """Structured JSON logging - minimal payloads only"""
@@ -108,7 +109,13 @@ async def fetch_data(session: aiohttp.ClientSession, ticker: str, interval: str)
     pretty = ticker.replace(".NS", "")
     mapped = get_safe_ticker(ticker)
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{mapped}"
-    params = {"range": DEFAULT_PERIOD, "interval": interval, "includePrePost": False}
+    
+    # CRITICAL FIX v6.2.1: Yahoo API requires string "false", not boolean False
+    params = {
+        "range": DEFAULT_PERIOD,
+        "interval": interval,
+        "includePrePost": "false"  # Fixed: was False (boolean)
+    }
 
     key = (ticker, interval)
     for attempt in range(RETRY_COUNT):
@@ -223,7 +230,8 @@ def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
     if pd.isna(close) or pd.isna(open_) or pd.isna(volume):
         return None
 
-    if prev_close and prev_close != 0:
+    # Improved prev_close check (stylistic)
+    if prev_close not in (None, 0):
         if abs(close - prev_close) / prev_close > MAX_CIRCUIT_PCT:
             return None
 
@@ -459,7 +467,6 @@ async def run_engine():
     })
 
 # ---------------- ENTRY ----------------
-START_TS = time.time()
 def main():
     try:
         asyncio.run(run_engine())
