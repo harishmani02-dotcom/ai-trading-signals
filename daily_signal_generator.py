@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI TRADING SIGNALS - INTRADAY GENERATOR (15-MIN INTERVALS) - IMPROVED v2.0
-Generates Buy/Sell/Hold signals for Indian stocks during market hours
-Enhanced accuracy with better filters and validation
+AI TRADING SIGNALS - INTRADAY GENERATOR (15-MIN INTERVALS) - PROFESSIONAL v2.5
+Incorporates Liquidity, ATR-based Risk, and Circuit Detection for Real-World Safety.
 """
 
 import os
@@ -62,17 +61,22 @@ MAX_RETRIES = 3
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
-# IMPROVED: More conservative indicator periods
+# IMPROVED: Indicator periods
 RSI_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 BB_PERIOD = 20
-VOL_PERIOD = 10
+VOL_PERIOD = 20 # Increased volume period for better average
 
-# IMPROVED: Adjusted risk management
-STOP_LOSS_PCT = 1.5
-TARGET_PCT = 3.0
+# CRITICAL FIX: ATR-based risk management
+ATR_MULTIPLIER_SL = 1.5  # Stop Loss is 1.5 * ATR away
+ATR_MULTIPLIER_TP = 3.0  # Target is 3.0 * ATR away
+
+# CRITICAL FIX: Liquidity and Safety Filters
+MIN_PRICE = 50.0            # Minimum closing price
+MIN_AVG_VOLUME = 200000     # Minimum average volume over 20 periods
+MAX_CIRCUIT_PCT = 0.18      # Skip if movement is > 18% (to avoid near-circuit halts)
 
 # IMPROVED: Signal quality thresholds
 MIN_CONFIDENCE = 60
@@ -143,14 +147,15 @@ STOCKS = sanitize_tickers(STOCK_LIST)
 # STARTUP INFO
 # ================================================================
 print("=" * 70)
-print(f"{EMOJI_ROBOT} AI TRADING SIGNALS - INTRADAY GENERATOR v2.0 (IMPROVED)")
+print(f"{EMOJI_ROBOT} AI TRADING SIGNALS - INTRADAY GENERATOR v2.5 (PROFESSIONAL)")
 print("=" * 70)
 print(f"{EMOJI_CAL} Date: {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 print(f"{EMOJI_CHART} Stocks to analyze: {len(STOCKS)}")
 print(f"{EMOJI_CHART} Interval: {INTERVAL} candles")
 print(f"{EMOJI_LINK} Supabase URL: {SUPABASE_URL[:30]}...")
 print(f"⚡ Max workers: {MAX_WORKERS}")
-print(f"{EMOJI_TARGET} Stop Loss: {STOP_LOSS_PCT}% | Target: {TARGET_PCT}%")
+print(f"{EMOJI_TARGET} SL/TP (ATR Multipliers): {ATR_MULTIPLIER_SL} / {ATR_MULTIPLIER_TP} (Risk:Reward {ATR_MULTIPLIER_TP/ATR_MULTIPLIER_SL:.1f}:1)")
+print(f"🎯 Safety Filters: Min Price {EMOJI_RUPEE}{MIN_PRICE:.0f}, Min Avg Vol {MIN_AVG_VOLUME/1000:.0f}K")
 print(f"🎯 Quality filters: Min confidence {MIN_CONFIDENCE}%, Min votes {MIN_VOTES_FOR_ACTION}/6")
 print("=" * 70)
 print()
@@ -193,14 +198,13 @@ def get_value(series, idx):
         return None
 
 def validate_data_quality(data):
-    """FIXED: Uses timezone-aware timestamps for staleness check."""
+    """Uses timezone-aware timestamps for staleness check and gap detection."""
     if len(data) < 30:
         return False, f"Insufficient data ({len(data)} candles)"
     
-    # Ensure data index is timezone-aware for comparison
     data_index = data.index
     if data_index.tz is None:
-        # yfinance should return aware data, but if it doesn't, localize it
+        # Localize if somehow yfinance missed the timezone info
         data_index = data_index.tz_localize(IST_TZ)
         data.index = data_index
     
@@ -234,10 +238,15 @@ def calculate_intraday_indicators(prices):
     high = prices['High']
     low = prices['Low']
     
+    # CRITICAL FIX: Implement Wilder's Smoothing for more accurate RSI
     delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(RSI_PERIOD).mean()
-    loss = -delta.where(delta < 0, 0).rolling(RSI_PERIOD).mean()
-    rs = gain / loss.replace(0, 0.0001)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    avg_gain = gain.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, 0.0001)
     rsi = 100 - (100 / (1 + rs))
     
     ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
@@ -260,7 +269,7 @@ def calculate_intraday_indicators(prices):
     tr2 = abs(high - close.shift())
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
+    atr = tr.ewm(com=14 - 1, adjust=False).mean() # Wilder's smoothing for ATR
     
     return {
         'rsi': rsi,
@@ -277,14 +286,13 @@ def calculate_intraday_indicators(prices):
     }
 
 def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
-    """Fetches data and ensures the index is timezone-aware."""
+    """Fetches data, ensures index is timezone-aware and converted to IST."""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
                 time.sleep(RETRY_DELAY)
             
             stock = yf.Ticker(ticker)
-            # yfinance returns timezone-aware data (typically UTC, but localized by the exchange)
             data = stock.history(period=INTRADAY_PERIOD, interval=INTERVAL, auto_adjust=True)
             
             if hasattr(data, "columns") and isinstance(data.columns, pd.MultiIndex):
@@ -299,26 +307,17 @@ def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
             if 'Close' not in data.columns:
                 raise ValueError("Missing Close column")
             
-            valid_closes = data['Close'].dropna()
-            if len(valid_closes) < 30:
-                raise ValueError(f"Only {len(valid_closes)} valid closes")
-            
-            last_close = data['Close'].iloc[-1]
-            if pd.isna(last_close) or last_close <= 0:
-                raise ValueError(f"Invalid last close: {last_close}")
-            
-            # Ensure index is in IST for consistent logging/storage, converting from whatever yfinance gave
+            # Ensure index is in IST
             if data.index.tz is not None:
                 data.index = data.index.tz_convert(IST_TZ)
             else:
-                # Fallback, should not happen with yfinance, but localizes to IST if naive
                 data.index = data.index.tz_localize(IST_TZ)
 
             return data
             
         except Exception as e:
             if attempt == max_retries:
-                logging.error(f"Failed {ticker} after {max_retries} attempts: {e}")
+                logging.debug(f"Failed {ticker} after {max_retries} attempts: {e}")
                 return None
             else:
                 logging.debug(f"Attempt {attempt} failed for {ticker}: {e}")
@@ -333,7 +332,7 @@ def determine_trend(ema_20, ema_50, close_price):
         return 'Sideways'
 
 def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
-    pretty = stock_symbol.replace('.NS', '')
+    pretty = stock_symbol.replace('.NS', '').replace('.BO', '')
     prefix = f"[{stock_num}/{total}] " if total > 0 else ""
     
     try:
@@ -363,7 +362,16 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         if close_price is None or close_price <= 0:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Invalid close price")
             return None
-        
+
+        # CRITICAL FIX 1: Liquidity and Price Filters
+        avg_volume_20 = data['Volume'].tail(20).mean()
+        if close_price < MIN_PRICE:
+            print(f"{prefix}{EMOJI_WARNING} {pretty}: Too cheap ({EMOJI_RUPEE}{close_price:.2f}) - Skipped")
+            return None
+        if avg_volume_20 < MIN_AVG_VOLUME:
+            print(f"{prefix}{EMOJI_WARNING} {pretty}: Illiquid (Avg Vol {avg_volume_20/1000:.0f}K) - Skipped")
+            return None
+
         indicators = calculate_intraday_indicators(data)
         
         rsi_val = get_value(indicators['rsi'], last_idx) or 50.0
@@ -376,7 +384,16 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         vol_avg = get_value(indicators['vol_avg'], last_idx)
         ema_20 = get_value(indicators['ema_20'], last_idx) or close_price
         ema_50 = get_value(indicators['ema_50'], last_idx) or close_price
-        atr_val = get_value(indicators['atr'], last_idx) or (close_price * 0.02)
+        atr_val = get_value(indicators['atr'], last_idx) or (close_price * 0.005) # Smaller fallback ATR
+        
+        # CRITICAL FIX 3: Circuit Detection
+        if len(data) >= 2 and 'Close' in data.columns:
+            prev_close_val = get_value(data['Close'], -2)
+            if prev_close_val and prev_close_val > 0:
+                daily_move_pct = abs(close_price - prev_close_val) / prev_close_val
+                if daily_move_pct > MAX_CIRCUIT_PCT:
+                    print(f"{prefix}{EMOJI_WARNING} {pretty}: Near circuit limit ({daily_move_pct*100:.1f}%) - Skipped")
+                    return None
         
         votes = []
         strength_score = 0
@@ -435,18 +452,22 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         else:
             votes.append('Hold')
         
+        # CRITICAL FIX 4: Improved Volume Confirmation
         if volume and vol_avg:
-            vol_ratio = volume / vol_avg
+            # Compare current volume to the trailing 20-period average ending *before* this candle
+            vol_avg_prior = data['Volume'].rolling(VOL_PERIOD).mean().iloc[-2] if len(data) >= VOL_PERIOD else vol_avg
             
-            if vol_ratio > 1.8:
+            vol_ratio = volume / vol_avg_prior if vol_avg_prior > 0 else 0
+            
+            if vol_ratio > 2.0:
                 if close_price > open_price:
                     votes.append('Buy')
                     strength_score += 3
-                    reasons.append(f"High vol bullish")
+                    reasons.append(f"High vol bullish (Vol Ratio {vol_ratio:.1f})")
                 elif close_price < open_price:
                     votes.append('Sell')
                     strength_score += 3
-                    reasons.append(f"High vol bearish")
+                    reasons.append(f"High vol bearish (Vol Ratio {vol_ratio:.1f})")
                 else:
                     votes.append('Hold')
             elif vol_ratio < 0.6:
@@ -509,12 +530,13 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             signal = 'Hold'
             confidence = 50
         
+        # CRITICAL FIX 2: ATR-based Stop Loss & Target
         if signal == 'Buy':
-            stop_loss = round(close_price * (1 - STOP_LOSS_PCT/100), 2)
-            target = round(close_price * (1 + TARGET_PCT/100), 2)
+            stop_loss = round(close_price - (atr_val * ATR_MULTIPLIER_SL), 2)
+            target = round(close_price + (atr_val * ATR_MULTIPLIER_TP), 2)
         elif signal == 'Sell':
-            stop_loss = round(close_price * (1 + STOP_LOSS_PCT/100), 2)
-            target = round(close_price * (1 - TARGET_PCT/100), 2)
+            stop_loss = round(close_price + (atr_val * ATR_MULTIPLIER_SL), 2)
+            target = round(close_price - (atr_val * ATR_MULTIPLIER_TP), 2)
         else:
             stop_loss = None
             target = None
@@ -523,7 +545,8 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         if stop_loss and target:
             risk = abs(close_price - stop_loss)
             reward = abs(target - close_price)
-            risk_reward = round(reward / risk, 2) if risk > 0 else None
+            # Ensure risk is not near zero to prevent division errors
+            risk_reward = round(reward / risk, 2) if risk > (close_price * 0.001) else None
         
         now_ist = datetime.now(IST_TZ)
         
@@ -540,7 +563,6 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             'buy_votes': int(buy_count),
             'sell_votes': int(sell_count),
             'hold_votes': int(hold_count),
-            # FIXED: Use timezone-aware 'now' for date/time fields
             'signal_date': now_ist.date().isoformat(),
             'signal_time': now_ist.strftime('%H:%M:%S'),
             'interval': INTERVAL
@@ -556,7 +578,6 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         return result
         
     except Exception as e:
-        # Catch specific yfinance delisted/404 errors and log them as INFO/WARNING
         error_msg = str(e)
         if "No data found, symbol may be delisted" in error_msg or "Quote not found" in error_msg:
              logging.warning(f"{prefix}{EMOJI_WARNING} {pretty}: Data fetching failed (Delisted/404)")
@@ -590,15 +611,11 @@ def main():
     print(f"{EMOJI_ROCKET} Starting improved intraday signal generation...\n")
     
     try:
-        # FIXED: Use timezone-aware 'now'
         today = datetime.now(IST_TZ).date().isoformat()
         print(f"{EMOJI_WARNING} Deleting today's old signals (date: {today})...")
         delete_resp = supabase.table('signals').delete().eq('signal_date', today).execute()
         
         if hasattr(delete_resp, 'data'):
-            # The 'delete' response usually just confirms the action, data might be None or empty list
-            # A successful delete HTTP code (204 or 200) usually means it worked.
-            # Logging the HTTP status here would be better, but sticking to existing format:
             print(f"{EMOJI_CHECK} Old signals cleared (Checked against date: {today})\n")
         else:
             print(f"{EMOJI_CHECK} Old signals cleared\n")
@@ -642,7 +659,7 @@ def main():
     
     print()
     print("=" * 70)
-    print(f"{EMOJI_CHART} INTRADAY SUMMARY (IMPROVED v2.0)")
+    print(f"{EMOJI_CHART} INTRADAY SUMMARY (PROFESSIONAL v2.5)")
     print("=" * 70)
     print(f"{EMOJI_CHECK} Successfully processed: {success} stocks")
     print(f"{EMOJI_CROSS} Failed: {failed} stocks")
@@ -692,23 +709,20 @@ def main():
             print(f"\n{EMOJI_TARGET} Average Risk:Reward Ratio: {valid_rr.mean():.2f}")
     
     if failed_tickers:
-        print(f"\n{EMOJI_WARNING} Failed tickers: {', '.join([t.replace('.NS', '') for t in failed_tickers[:10]])}")
+        print(f"\n{EMOJI_WARNING} Failed tickers: {', '.join([t.replace('.NS', '').replace('.BO', '') for t in failed_tickers[:10]])}")
         if len(failed_tickers) > 10:
             print(f"   ... and {len(failed_tickers) - 10} more")
     
     print()
     print("=" * 70)
-    print(f"{EMOJI_CHECK} IMPROVED INTRADAY SIGNAL GENERATION COMPLETE!")
-    # FIXED: Use timezone-aware 'now'
+    print(f"{EMOJI_CHECK} PROFESSIONAL INTRADAY SIGNAL GENERATION COMPLETE!")
     print(f"{EMOJI_CLOCK} Completed at: {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"📝 Improvements: Better trend filtering, stricter vote requirements,")
-    print(f" data quality validation, realistic confidence caps")
+    print(f"📝 Improvements: Liquidity filtering, ATR-based risk, Circuit detection, Wilder's RSI.")
     print("=" * 70)
     
     sys.exit(0 if success > 0 else 1)
 
 if __name__ == "__main__":
-    # Check if pytz is available
     try:
         import pytz
     except ImportError:
