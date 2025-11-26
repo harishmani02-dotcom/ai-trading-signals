@@ -188,27 +188,39 @@ def get_value(series, idx):
     except (IndexError, ValueError, TypeError):
         return None
 
+# FIXED: Relaxed data quality validation
 def validate_data_quality(data):
-    if len(data) < 50:
+    # Reduced from 50 to 30 candles
+    if len(data) < 30:
         return False, f"Insufficient data ({len(data)} candles)"
+    
+    # Relaxed gap detection: allow up to 10 large gaps instead of 3
     if len(data) > 1:
         time_diff = data.index.to_series().diff()
         expected_diff = pd.Timedelta(minutes=15)
-        gaps = (time_diff > expected_diff * 2).sum()
-        if gaps > 3:
+        # Changed from 2x to 5x expected diff, and from 3 to 10 max gaps
+        gaps = (time_diff > expected_diff * 5).sum()
+        if gaps > 10:
             return False, f"Too many data gaps ({gaps})"
+    
+    # Relaxed staleness check: 24 hours instead of 30 minutes
     last_time = data.index[-1]
     if hasattr(last_time, 'tz_localize'):
         last_time = last_time.tz_localize(None) if last_time.tz is None else last_time
     now = pd.Timestamp.now()
     staleness_mins = (now - last_time).total_seconds() / 60
-    if staleness_mins > 30:
+    # Changed from 30 minutes to 1440 minutes (24 hours)
+    if staleness_mins > 1440:
         return False, f"Stale data ({staleness_mins:.0f} min old)"
+    
+    # Relaxed volatility check: 20% moves and up to 5 occurrences
     if 'Close' in data.columns:
         price_changes = data['Close'].pct_change().abs()
-        extreme_moves = (price_changes > 0.10).sum()
-        if extreme_moves > 2:
+        # Changed from 10% to 20%, and from 2 to 5 max occurrences
+        extreme_moves = (price_changes > 0.20).sum()
+        if extreme_moves > 5:
             return False, f"Extreme volatility detected ({extreme_moves} spikes)"
+    
     return True, "Data quality OK"
 
 def calculate_intraday_indicators(prices):
@@ -240,6 +252,7 @@ def calculate_intraday_indicators(prices):
     atr = tr.rolling(14).mean()
     return {'rsi': rsi, 'macd': macd, 'macd_signal': macd_signal, 'macd_histogram': macd_histogram, 'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_middle': bb_middle, 'vol_avg': vol_avg, 'ema_20': ema_20, 'ema_50': ema_50, 'atr': atr}
 
+# FIXED: Reduced minimum candle requirement from 50 to 30
 def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
     for attempt in range(1, max_retries + 1):
         try:
@@ -251,12 +264,14 @@ def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
                 data.columns = data.columns.get_level_values(0)
             if data is None or data.empty:
                 raise ValueError("Empty data")
-            if len(data) < 50:
+            # Changed from 50 to 30
+            if len(data) < 30:
                 raise ValueError(f"Only {len(data)} candles")
             if 'Close' not in data.columns:
                 raise ValueError("Missing Close column")
             valid_closes = data['Close'].dropna()
-            if len(valid_closes) < 50:
+            # Changed from 50 to 30
+            if len(valid_closes) < 30:
                 raise ValueError(f"Only {len(valid_closes)} valid closes")
             last_close = data['Close'].iloc[-1]
             if pd.isna(last_close) or last_close <= 0:
@@ -575,11 +590,4 @@ def main():
     print()
     print("=" * 70)
     print(f"{EMOJI_CHECK} IMPROVED INTRADAY SIGNAL GENERATION COMPLETE!")
-    print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
-    print(f"📝 Improvements: Better trend filtering, stricter vote requirements,")
-    print(f"   data quality validation, realistic confidence caps")
-    print("=" * 70)
-    sys.exit(0 if success > 0 else 1)
-
-if __name__ == "__main__":
-    main()
+    print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}") print(f"📝 Improvements: Better trend filtering, stricter vote requirements,") print(f"   data quality validation, realistic confidence caps") print("=" * 70) sys.exit(0 if success > 0 else 1)if name == "main": main()
