@@ -188,35 +188,28 @@ def get_value(series, idx):
     except (IndexError, ValueError, TypeError):
         return None
 
-# FIXED: Relaxed data quality validation
 def validate_data_quality(data):
-    # Reduced from 50 to 30 candles
+    """FIXED: Relaxed data quality validation"""
     if len(data) < 30:
         return False, f"Insufficient data ({len(data)} candles)"
     
-    # Relaxed gap detection: allow up to 10 large gaps instead of 3
     if len(data) > 1:
         time_diff = data.index.to_series().diff()
         expected_diff = pd.Timedelta(minutes=15)
-        # Changed from 2x to 5x expected diff, and from 3 to 10 max gaps
         gaps = (time_diff > expected_diff * 5).sum()
         if gaps > 10:
             return False, f"Too many data gaps ({gaps})"
     
-    # Relaxed staleness check: 24 hours instead of 30 minutes
     last_time = data.index[-1]
     if hasattr(last_time, 'tz_localize'):
         last_time = last_time.tz_localize(None) if last_time.tz is None else last_time
     now = pd.Timestamp.now()
     staleness_mins = (now - last_time).total_seconds() / 60
-    # Changed from 30 minutes to 1440 minutes (24 hours)
     if staleness_mins > 1440:
         return False, f"Stale data ({staleness_mins:.0f} min old)"
     
-    # Relaxed volatility check: 20% moves and up to 5 occurrences
     if 'Close' in data.columns:
         price_changes = data['Close'].pct_change().abs()
-        # Changed from 10% to 20%, and from 2 to 5 max occurrences
         extreme_moves = (price_changes > 0.20).sum()
         if extreme_moves > 5:
             return False, f"Extreme volatility detected ({extreme_moves} spikes)"
@@ -227,56 +220,81 @@ def calculate_intraday_indicators(prices):
     close = prices['Close']
     high = prices['High']
     low = prices['Low']
+    
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(RSI_PERIOD).mean()
     loss = -delta.where(delta < 0, 0).rolling(RSI_PERIOD).mean()
     rs = gain / loss.replace(0, 0.0001)
     rsi = 100 - (100 / (1 + rs))
+    
     ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
     ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
     macd = ema_fast - ema_slow
     macd_signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
     macd_histogram = macd - macd_signal
+    
     sma = close.rolling(BB_PERIOD).mean()
     std = close.rolling(BB_PERIOD).std()
     bb_upper = sma + (2 * std)
     bb_lower = sma - (2 * std)
     bb_middle = sma
+    
     vol_avg = prices['Volume'].rolling(VOL_PERIOD).mean()
     ema_20 = close.ewm(span=20, adjust=False).mean()
     ema_50 = close.ewm(span=50, adjust=False).mean()
+    
     tr1 = high - low
     tr2 = abs(high - close.shift())
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
-    return {'rsi': rsi, 'macd': macd, 'macd_signal': macd_signal, 'macd_histogram': macd_histogram, 'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_middle': bb_middle, 'vol_avg': vol_avg, 'ema_20': ema_20, 'ema_50': ema_50, 'atr': atr}
+    
+    return {
+        'rsi': rsi,
+        'macd': macd,
+        'macd_signal': macd_signal,
+        'macd_histogram': macd_histogram,
+        'bb_upper': bb_upper,
+        'bb_lower': bb_lower,
+        'bb_middle': bb_middle,
+        'vol_avg': vol_avg,
+        'ema_20': ema_20,
+        'ema_50': ema_50,
+        'atr': atr
+    }
 
-# FIXED: Reduced minimum candle requirement from 50 to 30
 def fetch_intraday_data(ticker: str, max_retries=MAX_RETRIES):
+    """FIXED: Reduced minimum candle requirement to 30"""
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
                 time.sleep(RETRY_DELAY)
+            
             stock = yf.Ticker(ticker)
             data = stock.history(period=INTRADAY_PERIOD, interval=INTERVAL, auto_adjust=True)
+            
             if hasattr(data, "columns") and isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
+            
             if data is None or data.empty:
                 raise ValueError("Empty data")
-            # Changed from 50 to 30
+            
             if len(data) < 30:
                 raise ValueError(f"Only {len(data)} candles")
+            
             if 'Close' not in data.columns:
                 raise ValueError("Missing Close column")
+            
             valid_closes = data['Close'].dropna()
-            # Changed from 50 to 30
             if len(valid_closes) < 30:
                 raise ValueError(f"Only {len(valid_closes)} valid closes")
+            
             last_close = data['Close'].iloc[-1]
             if pd.isna(last_close) or last_close <= 0:
                 raise ValueError(f"Invalid last close: {last_close}")
+            
             return data
+            
         except Exception as e:
             if attempt == max_retries:
                 logging.debug(f"Failed {ticker} after {max_retries} attempts: {e}")
@@ -294,30 +312,37 @@ def determine_trend(ema_20, ema_50, close_price):
 def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
     pretty = stock_symbol.replace('.NS', '')
     prefix = f"[{stock_num}/{total}] " if total > 0 else ""
+    
     try:
         data = fetch_intraday_data(stock_symbol)
         if data is None:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Failed to fetch data")
             return None
+        
         is_valid, quality_msg = validate_data_quality(data)
         if not is_valid:
             print(f"{prefix}{EMOJI_WARNING} {pretty}: {quality_msg}")
             return None
+        
         required_cols = ['Close', 'Open', 'High', 'Low', 'Volume']
         missing = [c for c in required_cols if c not in data.columns]
         if missing:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Missing columns: {missing}")
             return None
+        
         last_idx = -1
         close_price = get_value(data['Close'], last_idx)
         open_price = get_value(data['Open'], last_idx)
         high_price = get_value(data['High'], last_idx)
         low_price = get_value(data['Low'], last_idx)
         volume = get_value(data['Volume'], last_idx)
+        
         if close_price is None or close_price <= 0:
             print(f"{prefix}{EMOJI_CROSS} {pretty}: Invalid close price")
             return None
+        
         indicators = calculate_intraday_indicators(data)
+        
         rsi_val = get_value(indicators['rsi'], last_idx) or 50.0
         macd_val = get_value(indicators['macd'], last_idx) or 0.0
         macd_sig_val = get_value(indicators['macd_signal'], last_idx) or 0.0
@@ -329,16 +354,20 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         ema_20 = get_value(indicators['ema_20'], last_idx) or close_price
         ema_50 = get_value(indicators['ema_50'], last_idx) or close_price
         atr_val = get_value(indicators['atr'], last_idx) or (close_price * 0.02)
+        
         votes = []
         strength_score = 0
         reasons = []
+        
         trend = determine_trend(ema_20, ema_50, close_price)
+        
         if trend == 'Uptrend':
             strength_score += 3
             reasons.append(f"Uptrend")
         elif trend == 'Downtrend':
             strength_score += 3
             reasons.append(f"Downtrend")
+        
         if rsi_val < 30:
             votes.append('Buy')
             strength_score += 3
@@ -357,6 +386,7 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             reasons.append(f"RSI bounce")
         else:
             votes.append('Hold')
+        
         if macd_val > macd_sig_val and macd_hist > 0:
             votes.append('Buy')
             strength_score += 2
@@ -367,8 +397,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             reasons.append("MACD bearish")
         else:
             votes.append('Hold')
+        
         bb_width = bb_up_val - bb_low_val
         bb_position = (close_price - bb_low_val) / bb_width if bb_width > 0 else 0.5
+        
         if bb_position < 0.15:
             votes.append('Buy')
             strength_score += 2
@@ -379,8 +411,10 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             reasons.append(f"Near BB upper")
         else:
             votes.append('Hold')
+        
         if volume and vol_avg:
             vol_ratio = volume / vol_avg
+            
             if vol_ratio > 1.8:
                 if close_price > open_price:
                     votes.append('Buy')
@@ -399,10 +433,13 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
                 votes.append('Hold')
         else:
             votes.append('Hold')
+        
         candle_body = close_price - open_price if open_price else 0
         candle_range = high_price - low_price if (high_price and low_price) else 0
+        
         if candle_range > 0:
             body_ratio = abs(candle_body) / candle_range
+            
             if candle_body > 0 and body_ratio > 0.7:
                 votes.append('Buy')
                 strength_score += 2
@@ -418,11 +455,14 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
                 votes.append('Hold')
         else:
             votes.append('Hold')
+        
         buy_count = votes.count('Buy')
         sell_count = votes.count('Sell')
         hold_count = votes.count('Hold')
+        
         signal = 'Hold'
         base_conf = 30
+        
         if buy_count >= MIN_VOTES_FOR_ACTION and trend != 'Downtrend':
             signal = 'Buy'
             base_conf = (buy_count / 6) * 60
@@ -438,11 +478,14 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         else:
             signal = 'Hold'
             base_conf = 30
+        
         bonus = min(max(strength_score, 0) * 2, 25)
         confidence = min(base_conf + bonus, 80)
+        
         if signal != 'Hold' and confidence < MIN_CONFIDENCE:
             signal = 'Hold'
             confidence = 50
+        
         if signal == 'Buy':
             stop_loss = round(close_price * (1 - STOP_LOSS_PCT/100), 2)
             target = round(close_price * (1 + TARGET_PCT/100), 2)
@@ -452,11 +495,13 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
         else:
             stop_loss = None
             target = None
+        
         risk_reward = None
         if stop_loss and target:
             risk = abs(close_price - stop_loss)
             reward = abs(target - close_price)
             risk_reward = round(reward / risk, 2) if risk > 0 else None
+        
         result = {
             'symbol': pretty,
             'signal': signal,
@@ -474,12 +519,16 @@ def generate_intraday_signal(stock_symbol, stock_num=0, total=0):
             'signal_time': datetime.now().strftime('%H:%M:%S'),
             'interval': INTERVAL
         }
+        
         emoji = EMOJI_GREEN if signal == 'Buy' else EMOJI_RED if signal == 'Sell' else EMOJI_WHITE
         sl_info = f"SL:{EMOJI_RUPEE}{stop_loss} T:{EMOJI_RUPEE}{target}" if stop_loss and target else ""
         trend_emoji = "📈" if trend == 'Uptrend' else "📉" if trend == 'Downtrend' else "➡️"
         reason_str = ", ".join(reasons[:2]) if reasons else ""
+        
         print(f"{prefix}{emoji} {pretty:12s} {signal:4s} ({confidence:.0f}%) @ {EMOJI_RUPEE}{close_price:.2f} {sl_info} {trend_emoji} [{reason_str}]")
+        
         return result
+        
     except Exception as e:
         logging.error(f"{prefix}{EMOJI_CROSS} {pretty}: Error: {e}")
         return None
@@ -490,23 +539,30 @@ def upload_batch(batch_data):
         if not valid_data:
             print(f"{EMOJI_WARNING} No valid data in batch")
             return 0
+        
         resp = supabase.table('signals').insert(valid_data).execute()
+        
         if isinstance(resp, dict) and resp.get('error'):
             logging.error(f"Batch upload error: {resp.get('error')}")
             return 0
+        
         if hasattr(resp, 'data') and resp.data:
             return len(resp.data)
+        
         return len(valid_data)
+        
     except Exception as e:
         logging.error(f"Batch upload failed: {e}")
         return 0
 
 def main():
     print(f"{EMOJI_ROCKET} Starting improved intraday signal generation...\n")
+    
     try:
         today = datetime.now().date().isoformat()
         print(f"{EMOJI_WARNING} Deleting today's old signals (date: {today})...")
         delete_resp = supabase.table('signals').delete().eq('signal_date', today).execute()
+        
         if hasattr(delete_resp, 'data'):
             deleted_count = len(delete_resp.data) if delete_resp.data else 0
             print(f"{EMOJI_CHECK} Deleted {deleted_count} old signals\n")
@@ -514,11 +570,17 @@ def main():
             print(f"{EMOJI_CHECK} Old signals cleared\n")
     except Exception as e:
         print(f"{EMOJI_WARNING} Could not delete old signals: {e}\n")
+    
     start_time = time.time()
     results = []
     failed_tickers = []
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_stock = {executor.submit(generate_intraday_signal, stock, i+1, len(STOCKS)): stock for i, stock in enumerate(STOCKS)}
+        future_to_stock = {
+            executor.submit(generate_intraday_signal, stock, i+1, len(STOCKS)): stock
+            for i, stock in enumerate(STOCKS)
+        }
+        
         for future in as_completed(future_to_stock):
             stock = future_to_stock[future]
             try:
@@ -530,16 +592,20 @@ def main():
             except Exception as e:
                 logging.error(f"Error processing {stock}: {e}")
                 failed_tickers.append(stock)
+    
     print(f"\n{EMOJI_ROCKET} Uploading {len(results)} signals...")
     uploaded = 0
+    
     for i in range(0, len(results), BATCH_SIZE):
         batch = results[i:i+BATCH_SIZE]
         count = upload_batch(batch)
         uploaded += count
         print(f" {EMOJI_CHECK} Batch {i//BATCH_SIZE + 1}: {count}/{len(batch)} uploaded")
+    
     elapsed = time.time() - start_time
     success = len(results)
     failed = len(failed_tickers)
+    
     print()
     print("=" * 70)
     print(f"{EMOJI_CHART} INTRADAY SUMMARY (IMPROVED v2.0)")
@@ -548,18 +614,23 @@ def main():
     print(f"{EMOJI_CROSS} Failed: {failed} stocks")
     print(f"⚡ Total time: {elapsed:.1f}s ({elapsed/len(STOCKS):.2f}s per stock)")
     print(f"⚡ Upload rate: {uploaded}/{success} ({100*uploaded/max(success,1):.1f}%)")
+    
     if results:
         df = pd.DataFrame(results)
+        
         buy_signals = df[df['signal'] == 'Buy']
         sell_signals = df[df['signal'] == 'Sell']
         hold_signals = df[df['signal'] == 'Hold']
+        
         high_quality_buys = buy_signals[buy_signals['confidence'] > 70]
         high_quality_sells = sell_signals[sell_signals['confidence'] > 70]
+        
         print()
         print(f"{EMOJI_GREEN} Buy signals: {len(buy_signals)} (High quality: {len(high_quality_buys)})")
         print(f"{EMOJI_RED} Sell signals: {len(sell_signals)} (High quality: {len(high_quality_sells)})")
         print(f"{EMOJI_WHITE} Hold signals: {len(hold_signals)}")
         print(f"{EMOJI_CHART} Average confidence: {df['confidence'].mean():.1f}%")
+        
         if len(high_quality_buys) > 0:
             print(f"\n{EMOJI_FIRE} TOP 3 HIGH-QUALITY BUY SIGNALS (>70% confidence):")
             for _, row in high_quality_buys.nlargest(3, 'confidence').iterrows():
@@ -570,6 +641,7 @@ def main():
             for _, row in buy_signals.nlargest(3, 'confidence').iterrows():
                 rr = f"R:R {row['risk_reward']}" if row['risk_reward'] else ""
                 print(f" {EMOJI_GREEN} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
+        
         if len(high_quality_sells) > 0:
             print(f"\n{EMOJI_FIRE} TOP 3 HIGH-QUALITY SELL SIGNALS (>70% confidence):")
             for _, row in high_quality_sells.nlargest(3, 'confidence').iterrows():
@@ -580,20 +652,24 @@ def main():
             for _, row in sell_signals.nlargest(3, 'confidence').iterrows():
                 rr = f"R:R {row['risk_reward']}" if row['risk_reward'] else ""
                 print(f" {EMOJI_RED} {row['symbol']:12s} {row['confidence']:.0f}% {EMOJI_RUPEE}{row['close_price']:.2f} → T:{EMOJI_RUPEE}{row['target']} {rr}")
+        
         valid_rr = df[df['risk_reward'].notna()]['risk_reward']
         if len(valid_rr) > 0:
             print(f"\n{EMOJI_TARGET} Average Risk:Reward Ratio: {valid_rr.mean():.2f}")
+    
     if failed_tickers:
         print(f"\n{EMOJI_WARNING} Failed tickers: {', '.join([t.replace('.NS', '') for t in failed_tickers[:10]])}")
         if len(failed_tickers) > 10:
             print(f"   ... and {len(failed_tickers) - 10} more")
+    
     print()
     print("=" * 70)
     print(f"{EMOJI_CHECK} IMPROVED INTRADAY SIGNAL GENERATION COMPLETE!")
     print(f"{EMOJI_CLOCK} Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"📝 Improvements: Better trend filtering, stricter vote requirements,")
-    print(f"   data quality validation, realistic confidence caps")
+    print(f" data quality validation, realistic confidence caps")
     print("=" * 70)
+    
     sys.exit(0 if success > 0 else 1)
 
 if __name__ == "__main__":
