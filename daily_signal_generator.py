@@ -1,421 +1,492 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Finspark AI – v6.1 FINAL PRODUCTION SINGLE FILE ENGINE
-- Builds on v6.0 with 8 fixes (delete old signals, volume spike, ATR fallback,
-  improved 429 backoff, signal limiter, risk log, cleaned output, speed tweaks)
+Finspark AI — v6.1 FINAL (single-file)
+- Implements v6.0 fixes + v6.1 improvements:
+  1) Safe daily deletion (non-destructive, env gated)
+  2) Volume-spike signal + ATR fallback
+  3) Exponential backoff + jitter for 429/network
+  4) Signal count limiter (top-K by confidence)
+  5) Append-only risk log (engine_risk_log)
+  6) Structured JSON logging + human logs
+  7) Dynamic concurrency tuning (based on runners)
+  8) Minor speed optimizations & safer NaN checks
+Usage: set SUPABASE_URL and SUPABASE_KEY as secrets/env and run.
 """
 import os
 import sys
 import asyncio
 import logging
 import time
+import json
+import random
 from datetime import datetime, time as dt_time
 import pytz
 import aiohttp
 import pandas as pd
 import numpy as np
 from supabase import create_client
-import random
-from typing import Tuple, Optional
 
-# ------------------ CONFIGURATION ------------------
-SUPABASE_URL = os.getenv('SUPABASE_URL', 'YOUR_SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'YOUR_SUPABASE_KEY')
+# ---------------- CONFIG (ENV knobs)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+DB_TABLE_SIGNALS = os.getenv("DB_TABLE_SIGNALS", "intraday_signals_v6_final")
+DB_TABLE_ERRORS = os.getenv("DB_TABLE_ERRORS", "engine_errors_v6_final")
+DB_TABLE_RISKLOG = os.getenv("DB_TABLE_RISKLOG", "engine_risk_log")
 
-# Tables (non-disruptive)
-DB_TABLE_SIGNALS = "intraday_signals_v6_final"
-DB_TABLE_ERRORS = "engine_errors_v6_final"
-DB_TABLE_RISK = "intraday_risk_log_v6"   # new risk log table
+# Behavior flags:
+CLEAR_TODAY = os.getenv("CLEAR_TODAY", "false").lower() in ("1", "true", "yes")
+MAX_SIGNALS = int(os.getenv("MAX_SIGNALS", "150"))         # top-K per run
+VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "3.0")) # volume spike multiplier
+MIN_CONF_TO_UPLOAD = float(os.getenv("MIN_CONF_TO_UPLOAD", "0")) # optional threshold
 
-TIME_FRAMES = ['5m', '15m', '30m', '1h']
-DEFAULT_PERIOD = "7d"
-
+# Timeframes & Tickers
+TIME_FRAMES = os.getenv("TIME_FRAMES", "5m,15m,30m,1h").split(",")
+DEFAULT_PERIOD = os.getenv("DEFAULT_PERIOD", "7d")
 IST = pytz.timezone("Asia/Kolkata")
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
-STOCK_LIST = [
-    'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'ICICIBANK.NS',
-    'KOTAKBANK.NS', 'WIPRO.NS', 'HCLTECH.NS', 'LT.NS', 'ADANIENT.NS'
-]
+STOCK_LIST = os.getenv("STOCK_LIST", "RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS").split(",")
+TICKER_MAP = {}  # keep if needed to remap tickers
 
-TICKER_MAP = {
-    'CADILAHC.NS': 'ZYDUSLIFE.NS',
-    'LTI.NS': 'LTIM.NS',
-    'MINDTREE.NS': 'LTIM.NS',
-    'ADANIGAS.NS': 'ATGL.NS',
-}
-
-CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "20"))
+# Network & concurrency
+CPU_COUNT = max(1, (os.cpu_count() or 2))
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", str(min(40, CPU_COUNT * 4))))
 FETCH_TIMEOUT = int(os.getenv("FETCH_TIMEOUT", "30"))
-RETRY_COUNT = int(os.getenv("RETRY_COUNT", "4"))  # allow one extra retry for backoff
-SEMAPHORE = asyncio.Semaphore(CONCURRENCY_LIMIT)
+RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
 
+# Strategy params
 RSI_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-
 BB_PERIOD = 20
 VOL_PERIOD = 20
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.2"))
+TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "2.4"))
+MIN_CANDLE_COUNT = int(os.getenv("MIN_CANDLE_COUNT", "100"))
+MAX_CIRCUIT_PCT = float(os.getenv("MAX_CIRCUIT_PCT", "0.18"))
 
-SL_ATR_MULT = 1.2
-TP_ATR_MULT = 2.4
-
-MIN_CANDLE_COUNT = 100
-MAX_CIRCUIT_PCT = 0.18
-
-# NEW: Volume spike multiplier and max signals per run
-VOLUME_SPIKE_MULT = 1.8
-MAX_SIGNALS_PER_RUN = int(os.getenv("MAX_SIGNALS_PER_RUN", "40"))
-
-# Backoff jitter bounds (seconds)
-BACKOFF_BASE = 2.0
-BACKOFF_JITTER = 0.3
-
-# ------------------ LOGGING ------------------
+# Logging
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("FinsparkV6.1")
 
-# ------------------ UTILITIES ------------------
-def get_safe_ticker(t: str) -> str:
+# JSON logger for structured events
+def json_log(event_type: str, payload: dict):
+    out = {"ts": datetime.now(IST).isoformat(), "event": event_type}
+    out.update(payload)
+    logger.info(json.dumps(out, default=str))
+
+# ---------------- SAFE HELPERS ----------------
+def get_safe_ticker(t):
     return TICKER_MAP.get(t.upper(), t.upper())
 
 def safe_iloc(series: pd.Series, idx: int, fallback=np.nan):
+    """Robust iloc supporting negative indices and NaN-safe returns."""
     if not isinstance(series, pd.Series) or series.empty:
         return fallback
     try:
-        # Negative and positive index handling
         if idx < 0 and abs(idx) > len(series):
             return fallback
         if idx >= 0 and idx >= len(series):
             return fallback
         val = series.iloc[idx]
         return val if pd.notna(val) else fallback
-    except Exception:
+    except (IndexError, KeyError, TypeError):
         return fallback
 
-def is_market_open() -> Tuple[bool, str]:
+def is_market_open():
     now = datetime.now(IST)
     if now.weekday() > 4:
         return False, "Weekend"
-    if (now.time() >= MARKET_OPEN) and (now.time() <= MARKET_CLOSE):
-        return True, "Open"
-    return False, "Closed"
+    # Market open inclusive at MARKET_OPEN, exclusive of MARKET_CLOSE end-of-minute (configurable)
+    is_open = (MARKET_OPEN <= now.time() < MARKET_CLOSE)
+    return is_open, "Open" if is_open else "Closed"
 
-# ------------------ FETCHING (with improved backoff) ------------------
-async def fetch_data(ticker: str, session: aiohttp.ClientSession, interval: str):
+# ---------------- BACKOFF + JITTER ----------------
+async def backoff_sleep(attempt: int, base: float = 1.0, cap: float = 30.0):
+    # exponential backoff with jitter
+    delay = min(cap, base * (2 ** attempt))
+    jitter = delay * (0.5 + random.random() * 0.5)  # 0.5x - 1.0x jitter
+    await asyncio.sleep(jitter)
+
+# ---------------- FETCH (Yahoo V8 endpoint) ----------------
+SEM = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+async def fetch_data(session: aiohttp.ClientSession, ticker: str, interval: str):
     pretty = ticker.replace(".NS", "")
     mapped = get_safe_ticker(ticker)
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{mapped}"
     params = {"range": DEFAULT_PERIOD, "interval": interval, "includePrePost": False}
-    key = (ticker, interval)
 
+    key = (ticker, interval)
     for attempt in range(RETRY_COUNT):
-        async with SEMAPHORE:
+        async with SEM:
             try:
                 resp = await asyncio.wait_for(session.get(url, params=params), timeout=FETCH_TIMEOUT)
                 async with resp:
                     if resp.status == 429:
-                        # raise to go into except and backoff
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=429, message="RateLimit")
+                        json_log("rate_limit", {"ticker": pretty, "interval": interval, "attempt": attempt + 1})
+                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=429)
                     resp.raise_for_status()
                     raw = await resp.json()
-                result = raw.get("chart", {}).get("result", [])
-                if not result:
+                chart = raw.get("chart", {}).get("result", [])
+                if not chart:
                     return key, None, None
-                meta = result[0].get('meta', {})
-                q = result[0]['indicators'].get('quote', [{}])[0]
-                ts = result[0].get('timestamp', [])
-                if not ts or not q.get('close'):
+                meta = chart[0].get("meta", {})
+                quote = chart[0].get("indicators", {}).get("quote", [{}])[0]
+                timestamps = chart[0].get("timestamp", [])
+                if not timestamps or not quote.get("close"):
                     return key, None, None
                 df = pd.DataFrame({
-                    "Datetime": [datetime.fromtimestamp(x, IST) for x in ts],
-                    "Open": q.get('open', []),
-                    "High": q.get('high', []),
-                    "Low": q.get('low', []),
-                    "Close": q.get('close', []),
-                    "Volume": q.get('volume', [])
+                    "Datetime": [datetime.fromtimestamp(ts, IST) for ts in timestamps],
+                    "Open": quote.get("open", []),
+                    "High": quote.get("high", []),
+                    "Low": quote.get("low", []),
+                    "Close": quote.get("close", []),
+                    "Volume": quote.get("volume", []),
                 }).set_index("Datetime")
-                prev_close = meta.get("previousClose")
-                return key, df, prev_close
-            except aiohttp.ClientResponseError as cre:
-                # specific handling
-                if getattr(cre, "status", None) == 429:
-                    wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, BACKOFF_JITTER)
-                    logger.warning(f"{pretty} [{interval}] 429 — backoff {wait:.1f}s (attempt {attempt+1}/{RETRY_COUNT})")
-                    await asyncio.sleep(wait)
+                return key, df, meta.get("previousClose")
+            except aiohttp.ClientResponseError as e:
+                if getattr(e, "status", None) == 429:
+                    await backoff_sleep(attempt, base=1.0)
                     continue
-                else:
-                    logger.warning(f"{pretty} [{interval}] HTTP error {getattr(cre,'status',cre)} (attempt {attempt+1})")
-            except asyncio.TimeoutError:
-                wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, BACKOFF_JITTER)
-                logger.warning(f"{pretty} [{interval}] Timeout — backoff {wait:.1f}s (attempt {attempt+1})")
-                await asyncio.sleep(wait)
+                # other client errors - short backoff
+                await backoff_sleep(attempt, base=0.5)
+                continue
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                json_log("network_error", {"ticker": pretty, "interval": interval, "error": str(e), "attempt": attempt + 1})
+                await backoff_sleep(attempt, base=0.5)
+                continue
             except Exception as e:
-                # generic
-                wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, BACKOFF_JITTER)
-                logger.debug(f"{pretty} [{interval}] fetch error {e} — backoff {wait:.1f}s (attempt {attempt+1})")
-                await asyncio.sleep(wait)
-    # final fail
+                json_log("fetch_fatal", {"ticker": pretty, "interval": interval, "error": str(e)})
+                break
     return key, None, None
 
-# ------------------ INDICATORS ------------------
-def indicators(df: pd.DataFrame) -> Optional[dict]:
+# ---------------- INDICATORS ----------------
+def compute_indicators(df: pd.DataFrame):
     if df is None or len(df) < MIN_CANDLE_COUNT:
         return None
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low - close.shift()).abs()
     ], axis=1).max(axis=1)
     atr = tr.ewm(com=13, adjust=False).mean()
-    ema_20 = close.ewm(span=20).mean()
-    ema_50 = close.ewm(span=50).mean()
-    ema20_start = safe_iloc(ema_20, -5)
-    ema20_end = safe_iloc(ema_20, -1)
-    slope = (ema20_end - ema20_start) / 5 if ema20_start is not np.nan else 0
-    angle = np.arctan(slope) * (180.0 / np.pi)
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema20_start = safe_iloc(ema20, -5)
+    ema20_end = safe_iloc(ema20, -1)
+    slope = (ema20_end - ema20_start) / 5 if not pd.isna(ema20_start) else 0
+    angle = np.degrees(np.arctan(slope))
+
     delta = close.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.ewm(com=13, adjust=False).mean()
-    avg_loss = loss.ewm(com=13, adjust=False).mean().mask(lambda x: x == 0, 1e-10)
+    avg_gain = gain.ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=RSI_PERIOD - 1, adjust=False).mean().replace(0, 1e-10)
     rsi = 100 - (100 / (1 + (avg_gain / avg_loss)))
-    ema_fast = close.ewm(span=MACD_FAST).mean()
-    ema_slow = close.ewm(span=MACD_SLOW).mean()
+
+    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
     macd = ema_fast - ema_slow
-    macd_signal = macd.ewm(span=MACD_SIGNAL).mean()
+    macd_signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
     macd_hist = macd - macd_signal
+
     sma = close.rolling(BB_PERIOD).mean()
     std = close.rolling(BB_PERIOD).std()
     bb_upper = sma + 2 * std
     bb_lower = sma - 2 * std
-    bb_width = ((bb_upper - bb_lower) / sma * 100).iloc[-1] if not sma.empty else np.nan
-    vol_avg_series = df['Volume'].rolling(VOL_PERIOD).mean()
-    vol_avg = safe_iloc(vol_avg_series, -1, df['Volume'].mean())
-    # ATR fallback
-    atr_val = safe_iloc(atr, -1, np.nan)
-    if pd.isna(atr_val) or atr_val <= 0:
-        last_close = safe_iloc(close, -1, None)
-        atr_val = (last_close * 0.005) if last_close and last_close > 0 else 1.0
+    bb_width = ((bb_upper - bb_lower) / sma).replace([np.inf, -np.inf], np.nan).fillna(0) * 100
+
+    vol_avg_series = df["Volume"].rolling(VOL_PERIOD).mean()
+    vol_avg = safe_iloc(vol_avg_series, -1, fallback=float(df["Volume"].mean()))
+
     return {
-        "rsi": safe_iloc(rsi, -1),
-        "atr": atr_val,
-        "ema20": ema20_end,
-        "ema50": safe_iloc(ema_50, -1),
-        "angle": angle,
-        "macd_hist": safe_iloc(macd_hist, -1),
-        "bb_upper": safe_iloc(bb_upper, -1),
-        "bb_lower": safe_iloc(bb_lower, -1),
-        "bb_width": bb_width,
-        "vol_avg": vol_avg
+        "rsi": float(safe_iloc(rsi, -1, fallback=np.nan)),
+        "atr": float(safe_iloc(atr, -1, fallback=np.nan)),
+        "ema20": float(ema20_end) if not pd.isna(ema20_end) else np.nan,
+        "ema50": float(safe_iloc(ema50, -1, fallback=np.nan)),
+        "angle": float(angle),
+        "macd_hist": float(safe_iloc(macd_hist, -1, fallback=0.0)),
+        "bb_upper": float(safe_iloc(bb_upper, -1, fallback=np.nan)),
+        "bb_lower": float(safe_iloc(bb_lower, -1, fallback=np.nan)),
+        "bb_width": float(safe_iloc(bb_width, -1, fallback=0.0)),
+        "vol_avg": float(vol_avg)
     }
 
-# ------------------ TREND ------------------
-def trend_logic(ind: dict, close: float) -> str:
-    if pd.isna(ind.get("ema20")) or pd.isna(ind.get("ema50")):
-        return "Sideways"
-    if ind.get("bb_width", 9999) < 1.5:
-        return "Squeeze"
-    if ind["ema20"] > ind["ema50"] and close > ind["ema20"] and ind["angle"] > 5:
-        return "Uptrend"
-    if ind["ema20"] < ind["ema50"] and close < ind["ema20"] and ind["angle"] < -5:
-        return "Downtrend"
-    return "Sideways"
+# ---------------- SIGNAL GENERATION ----------------
+def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
+    close = safe_iloc(df["Close"], -1, fallback=np.nan)
+    open_ = safe_iloc(df["Open"], -1, fallback=np.nan)
+    high = safe_iloc(df["High"], -1, fallback=np.nan)
+    low = safe_iloc(df["Low"], -1, fallback=np.nan)
+    volume = safe_iloc(df["Volume"], -1, fallback=np.nan)
 
-# ------------------ SIGNAL LOGIC (with volume spike & ATR fallback) ------------------
-def generate_signal(df: pd.DataFrame, prev_close: Optional[float], symbol: str, interval: str) -> Optional[dict]:
-    close = safe_iloc(df.get("Close"), -1)
-    open_ = safe_iloc(df.get("Open"), -1)
-    high = safe_iloc(df.get("High"), -1)
-    low = safe_iloc(df.get("Low"), -1)
-    volume = safe_iloc(df.get("Volume"), -1)
-    if pd.isna(close) or pd.isna(open_):
+    if pd.isna(close) or pd.isna(open_) or pd.isna(volume):
         return None
-    if prev_close and abs(close - prev_close) / prev_close > MAX_CIRCUIT_PCT:
-        # log as risk
+
+    # circuit safety
+    if prev_close and prev_close != 0:
+        if abs(close - prev_close) / prev_close > MAX_CIRCUIT_PCT:
+            json_log("skip_circuit", {"ticker": ticker, "interval": interval, "close": close, "prev_close": prev_close})
+            return None
+
+    ind = compute_indicators(df)
+    if not ind:
         return None
-    ind = indicators(df)
-    if ind is None:
-        return None
+
     votes = []
     reasons = []
-    tr = trend_logic(ind, close)
+    strength = 0
+
+    # trend
+    tr = "Sideways"
+    if not pd.isna(ind["ema20"]) and not pd.isna(ind["ema50"]):
+        if ind["bb_width"] < 1.5:
+            tr = "Squeeze"
+        elif ind["ema20"] > ind["ema50"] and close > ind["ema20"] and ind["angle"] > 5:
+            tr = "Uptrend"
+        elif ind["ema20"] < ind["ema50"] and close < ind["ema20"] and ind["angle"] < -5:
+            tr = "Downtrend"
+
     if tr != "Sideways":
         reasons.append(tr)
-    # RSI
-    rsi_val = ind.get("rsi", 50)
-    if rsi_val < 30:
-        votes.append("Buy"); reasons.append(f"RSI {rsi_val:.1f}")
-    elif rsi_val > 70:
-        votes.append("Sell"); reasons.append(f"RSI {rsi_val:.1f}")
-    # MACD histogram
-    macdh = ind.get("macd_hist", 0.0)
-    if macdh > 0:
-        votes.append("Buy"); reasons.append("MACD+")
-    elif macdh < 0:
-        votes.append("Sell"); reasons.append("MACD-")
+        strength += 2
+
+    # RSI votes
+    if ind["rsi"] < 30:
+        votes.append("Buy"); reasons.append(f"RSI({ind['rsi']:.1f})"); strength += 2
+    elif ind["rsi"] > 70:
+        votes.append("Sell"); reasons.append(f"RSI({ind['rsi']:.1f})"); strength += 2
+
+    # MACD
+    if ind["macd_hist"] > 0:
+        votes.append("Buy"); reasons.append("MACD_hist_pos"); strength += 1
+    elif ind["macd_hist"] < 0:
+        votes.append("Sell"); reasons.append("MACD_hist_neg"); strength += 1
+
     # Bollinger
-    if close < ind.get("bb_lower", -1e12):
-        votes.append("Buy"); reasons.append("BB lower")
-    elif close > ind.get("bb_upper", 1e12):
-        votes.append("Sell"); reasons.append("BB upper")
-    # Volume spike rule (NEW)
-    vol_avg = ind.get("vol_avg", 0)
-    if volume and vol_avg and volume > vol_avg * VOLUME_SPIKE_MULT:
-        # correlate direction with candle
+    if close < ind["bb_lower"]:
+        votes.append("Buy"); reasons.append("BelowBB"); strength += 1
+    elif close > ind["bb_upper"]:
+        votes.append("Sell"); reasons.append("AboveBB"); strength += 1
+
+    # Volume spike vote (v6.1 feature)
+    vol_avg = ind.get("vol_avg") or 1
+    vol_ratio = volume / vol_avg if vol_avg > 0 else 0
+    if vol_ratio >= VOL_SPIKE_MULT:
         if close > open_:
-            votes.append("Buy"); reasons.append("Vol spike Bull")
-        elif close < open_:
-            votes.append("Sell"); reasons.append("Vol spike Bear")
-    buy = votes.count("Buy")
-    sell = votes.count("Sell")
+            votes.append("Buy"); reasons.append(f"VolSpike({vol_ratio:.1f}x)"); strength += 3
+        else:
+            votes.append("Sell"); reasons.append(f"VolSpike({vol_ratio:.1f}x)"); strength += 3
+
+    # Final decision
+    buy_count = votes.count("Buy")
+    sell_count = votes.count("Sell")
+
     signal = "Hold"
-    base_conf = 40
-    if buy > sell and buy >= 2:
-        signal = "Buy"; base_conf += buy * 5
-    elif sell > buy and sell >= 2:
-        signal = "Sell"; base_conf += sell * 5
-    conf = min(base_conf + np.log1p(len(reasons)) * 10, 95)
-    # ATR fallback already handled in indicators
-    atr = ind.get("atr", max(close * 0.005, 1.0))
-    stop_loss = target = rr = None
+    base_conf = 40 + min(max(strength, 0) * 4, 50)
+    if buy_count > sell_count and buy_count >= 2:
+        signal = "Buy"
+        base_conf += buy_count * 5
+    elif sell_count > buy_count and sell_count >= 2:
+        signal = "Sell"
+        base_conf += sell_count * 5
+
+    confidence = min(base_conf, 95.0)
+
+    # ATR fallback
+    atr = ind.get("atr") if not pd.isna(ind.get("atr")) else max(close * 0.003, 1.0)
+
+    sl = tp = rr = None
     if signal != "Hold" and atr and atr > 0:
         risk = atr * SL_ATR_MULT
         reward = atr * TP_ATR_MULT
-        rr = round(reward / risk, 2) if risk > 0 else None
         if signal == "Buy":
-            stop_loss = round(close - risk, 2)
-            target = round(close + reward, 2)
+            sl = round(close - risk, 2)
+            tp = round(close + reward, 2)
         else:
-            stop_loss = round(close + risk, 2)
-            target = round(close - reward, 2)
+            sl = round(close + risk, 2)
+            tp = round(close - reward, 2)
+        rr = round(reward / risk, 2) if risk > 0 else None
+
     now = datetime.now(IST)
-    return {
-        "symbol": symbol.replace(".NS", ""),
+    result = {
+        "symbol": ticker.replace(".NS", ""),
         "interval": interval,
         "signal": signal,
-        "confidence": round(conf, 1),
-        "close_price": round(close, 2),
-        "stop_loss": stop_loss,
-        "target": target,
+        "confidence": round(float(confidence), 1),
+        "close_price": round(float(close), 2),
+        "stop_loss": sl,
+        "target": tp,
         "risk_reward": rr,
         "trend": tr,
+        "vol_ratio": round(float(vol_ratio), 2),
         "signal_date": now.date().isoformat(),
         "signal_time": now.strftime("%H:%M:%S"),
-        "reasons": ", ".join(reasons)
+        "reasons": ", ".join(reasons),
+        "raw_indicators": ind
     }
+    json_log("signal_generated", {"symbol": result["symbol"], "interval": interval, "signal": signal, "confidence": result["confidence"]})
+    return result
 
-# ------------------ SUPABASE HELPERS ------------------
-def log_error(supabase, err_type: str, msg: str, stock: str = "N/A", interval: str = "N/A"):
-    try:
-        supabase.table(DB_TABLE_ERRORS).insert({
-            "timestamp": datetime.now(IST).isoformat(),
-            "error_type": err_type,
-            "message": msg,
-            "stock": stock,
-            "interval": interval
-        }).execute()
-    except Exception:
-        logger.debug("Failed to log error to DB (non-critical).")
+# ---------------- SUPABASE HELPERS ----------------
+def ensure_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.critical("Supabase credentials missing. Set SUPABASE_URL and SUPABASE_KEY.")
+        sys.exit(1)
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def log_risk(supabase, event: str, details: str, stock: str = "N/A", interval: str = "N/A"):
+def clear_today_signals(supabase, table_name):
+    if not CLEAR_TODAY:
+        logger.info("CLEAR_TODAY not enabled — skipping deletion of today's signals.")
+        return
+    today = datetime.now(IST).date().isoformat()
     try:
-        supabase.table(DB_TABLE_RISK).insert({
-            "timestamp": datetime.now(IST).isoformat(),
-            "event": event,
-            "details": details,
-            "stock": stock,
-            "interval": interval
-        }).execute()
-    except Exception:
-        logger.debug("Failed to log risk event to DB (non-critical).")
-
-async def upload_signals(supabase, data: list):
-    try:
-        if not data:
-            return 0
-        res = supabase.table(DB_TABLE_SIGNALS).insert(data).execute()
-        return len(res.data) if hasattr(res, "data") and isinstance(res.data, list) else len(data)
+        supabase.table(table_name).delete().eq("signal_date", today).execute()
+        logger.info(f"Cleared today's signals from {table_name} (date={today}).")
     except Exception as e:
-        log_error(supabase, "UploadError", str(e))
+        json_log("delete_failed", {"table": table_name, "error": str(e)})
+
+def append_risklog(supabase, rows):
+    try:
+        if not rows:
+            return
+        # keep raw_indicators JSON-friendly
+        for r in rows:
+            r_copy = dict(r)
+            # convert raw_indicators to json serializable (if present)
+            if "raw_indicators" in r_copy:
+                r_copy["raw_indicators"] = json.dumps(r_copy["raw_indicators"], default=str)
+            supabase.table(DB_TABLE_RISKLOG).insert(r_copy).execute()
+    except Exception as e:
+        json_log("risklog_failed", {"error": str(e)})
+
+async def upload_signals(supabase, rows, table_name):
+    try:
+        if not rows:
+            return 0
+        # Filter by confidence threshold if set
+        filtered = [r for r in rows if r.get("confidence", 0) >= MIN_CONF_TO_UPLOAD]
+        resp = supabase.table(table_name).insert(filtered).execute()
+        # try to get number inserted
+        count = len(resp.data) if hasattr(resp, "data") and isinstance(resp.data, list) else len(filtered)
+        json_log("upload_complete", {"table": table_name, "uploaded": count})
+        return count
+    except Exception as e:
+        json_log("upload_failed", {"table": table_name, "error": str(e)})
         return 0
 
-def delete_old_signals_once(supabase):
-    try:
-        today_iso = datetime.now(IST).date().isoformat()
-        supabase.table(DB_TABLE_SIGNALS).delete().eq("signal_date", today_iso).execute()
-        logger.info("Old signals for today deleted (one-time).")
-    except Exception as e:
-        logger.warning(f"Failed to delete old signals: {e}")
-
-# ------------------ MAIN ENGINE (async processing + early cancel) ------------------
-async def run_engine(supabase):
-    start_time = time.time()
-    market_ok, status = is_market_open()
-    if not market_ok:
-        logger.info("Market is closed. Exiting run.")
+# ---------------- MAIN ENGINE ----------------
+async def run_engine():
+    supabase = ensure_supabase()
+    market_open, status = is_market_open()
+    json_log("engine_start", {"market_status": status, "timestamp": datetime.now(IST).isoformat(), "concurrency": CONCURRENCY_LIMIT})
+    if not market_open:
+        logger.info("Market closed — exiting without generating signals.")
+        # still do controlled cleanup if requested
+        if CLEAR_TODAY:
+            clear_today_signals(supabase, DB_TABLE_SIGNALS)
         return
-    # delete today's old signals (once)
-    delete_old_signals_once(supabase)
-    # create client session
-    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT + 5)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        # schedule tasks
-        tasks = [asyncio.create_task(fetch_data(stock, session, tf)) for stock in STOCK_LIST for tf in TIME_FRAMES]
-        total_tasks = len(tasks)
-        logger.info(f"Fetching {total_tasks} tasks with concurrency {CONCURRENCY_LIMIT}...")
-        signals = []
-        # process as they complete (speed & early-stop)
-        try:
-            for coro in asyncio.as_completed(tasks):
-                key, df, prev = await coro
-                stock, interval = key
-                if df is None or prev is None:
-                    log_error(supabase, "FetchFail", "No data or parse fail", stock, interval)
-                else:
-                    s = generate_signal(df, prev, stock, interval)
-                    if s:
-                        signals.append(s)
-                        # risk logging for high impact signals (example: confidence > 85 or huge move)
-                        if s.get("confidence", 0) >= 85 or (s.get("risk_reward") and s["risk_reward"] < 0.5):
-                            log_risk(supabase, "HighImpactSignal", str(s), stock, interval)
-                # early stop if reached max signals
-                if len(signals) >= MAX_SIGNALS_PER_RUN:
-                    logger.info(f"Reached max signals ({MAX_SIGNALS_PER_RUN}). Cancelling remaining fetch tasks.")
-                    # cancel remaining tasks
-                    for t in tasks:
-                        if not t.done():
-                            t.cancel()
-                    break
-        except asyncio.CancelledError:
-            logger.info("Remaining tasks cancelled.")
-        except Exception as e:
-            logger.error(f"Engine run error: {e}")
-            log_error(supabase, "EngineError", str(e))
-        # upload collected signals
-        uploaded = await upload_signals(supabase, signals)
-        elapsed = time.time() - start_time
-        logger.info(f"Run complete: generated {len(signals)} signals, uploaded {uploaded}. Time: {elapsed:.1f}s")
 
-# ------------------ ENTRY POINT ------------------
+    # safe daily deletion (env gated)
+    if CLEAR_TODAY:
+        clear_today_signals(supabase, DB_TABLE_SIGNALS)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for ticker in STOCK_LIST:
+            for tf in TIME_FRAMES:
+                tasks.append(fetch_data(session, ticker.strip(), tf.strip()))
+
+        # run fetches concurrently
+        raw_results = await asyncio.gather(*tasks)
+    # map by key robustly
+    signals = []
+    risklog_rows = []
+    for item in raw_results:
+        try:
+            (ticker, interval), df, prev = item
+        except Exception:
+            # Some fetch tasks may return (key, None, None) shape; handle defensively
+            if isinstance(item, tuple) and len(item) == 3:
+                key = item[0] if len(item) > 0 else ("UNK", "UNK")
+                ticker, interval = key if isinstance(key, tuple) else ("UNK", "UNK")
+                df = item[1] if len(item) > 1 else None
+                prev = item[2] if len(item) > 2 else None
+            else:
+                continue
+
+        if df is None:
+            json_log("fetch_no_data", {"ticker": ticker, "interval": interval})
+            # log error
+            try:
+                supabase.table(DB_TABLE_ERRORS).insert({
+                    "timestamp": datetime.now(IST).isoformat(),
+                    "error_type": "FetchNoData",
+                    "message": f"No data for {ticker} {interval}",
+                    "stock": ticker, "interval": interval
+                }).execute()
+            except Exception:
+                pass
+            continue
+
+        s = generate_signal(df, prev, ticker, interval)
+        if s:
+            signals.append(s)
+            # prepare risk log row (append-only)
+            risklog_rows.append({
+                "timestamp": datetime.now(IST).isoformat(),
+                "symbol": s["symbol"],
+                "interval": s["interval"],
+                "signal": s["signal"],
+                "confidence": s["confidence"],
+                "close_price": s["close_price"],
+                "stop_loss": s["stop_loss"],
+                "target": s["target"],
+                "risk_reward": s["risk_reward"],
+                "reasons": s["reasons"],
+                "raw_indicators": json.dumps(s.get("raw_indicators", {}), default=str)
+            })
+
+    # apply top-K limiter (v6.1 feature)
+    if signals:
+        signals_sorted = sorted(signals, key=lambda r: (r.get("confidence", 0)), reverse=True)
+        top_signals = signals_sorted[:MAX_SIGNALS]
+    else:
+        top_signals = []
+
+    # upload signals (non-destructive to other tables)
+    uploaded_count = await upload_signals(supabase, top_signals, DB_TABLE_SIGNALS)
+
+    # append to risk log regardless of upload (append-only)
+    try:
+        append_risklog(supabase, risklog_rows)
+    except Exception as e:
+        json_log("risklog_upload_error", {"error": str(e)})
+
+    json_log("engine_end", {
+        "signals_generated": len(signals),
+        "signals_uploaded": uploaded_count,
+        "duration_s": round(time.time() - START_TS, 2)
+    })
+
+# ---------------- ENTRY ----------------
+START_TS = time.time()
 def main():
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # quick health check (non-destructive)
-        try:
-            supabase.table(DB_TABLE_ERRORS).select('*').limit(1).execute()
-        except Exception:
-            logger.info("DB health check failed or tables missing — continuing (non-destructive).")
-        asyncio.run(run_engine(supabase))
+        asyncio.run(run_engine())
     except Exception as e:
-        logger.critical(f"Fatal: {e}")
+        json_log("engine_fatal", {"error": str(e)})
+        logger.exception("Engine fatal error")
         sys.exit(1)
 
 if __name__ == "__main__":
