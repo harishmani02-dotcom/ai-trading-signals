@@ -35,7 +35,7 @@ MIN_CONF_TO_UPLOAD = float(os.getenv("MIN_CONF_TO_UPLOAD", "0"))
 TIME_FRAMES = os.getenv("TIME_FRAMES", "5m,15m,30m,1h").split(",")
 DEFAULT_PERIOD = os.getenv("DEFAULT_PERIOD", "7d")
 IST = pytz.timezone("Asia/Kolkata")
-MARKET_OPEN = dt_time(9, 15)
+MARKET_OPEN = dt_time(00, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
 STOCK_LIST = os.getenv("STOCK_LIST", "RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS").split(",")
