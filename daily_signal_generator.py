@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Finspark AI — v6.1 FINAL (single-file)
-- Implements v6.0 fixes + v6.1 improvements:
-  1) Safe daily deletion (non-destructive, env gated)
-  2) Volume-spike signal + ATR fallback
-  3) Exponential backoff + jitter for 429/network
-  4) Signal count limiter (top-K by confidence)
-  5) Append-only risk log (engine_risk_log)
-  6) Structured JSON logging + human logs
-  7) Dynamic concurrency tuning (based on runners)
-  8) Minor speed optimizations & safer NaN checks
-Usage: set SUPABASE_URL and SUPABASE_KEY as secrets/env and run.
+Finspark AI — v6.1 FINAL (Database Compatible Version)
+- Modified to work with existing 'signals' table schema
+- Implements all v6.1 improvements with proper schema mapping
+- Safe daily deletion, volume-spike signals, exponential backoff
+- Signal count limiter, structured logging, dynamic concurrency
+Usage: set SUPABASE_URL and SUPABASE_KEY as env vars and run.
 """
 import os
 import sys
@@ -30,25 +25,23 @@ from supabase import create_client
 # ---------------- CONFIG (ENV knobs)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-DB_TABLE_SIGNALS = os.getenv("DB_TABLE_SIGNALS", "intraday_signals_v6_final")
-DB_TABLE_ERRORS = os.getenv("DB_TABLE_ERRORS", "engine_errors_v6_final")
-DB_TABLE_RISKLOG = os.getenv("DB_TABLE_RISKLOG", "engine_risk_log")
+DB_TABLE_SIGNALS = os.getenv("DB_TABLE_SIGNALS", "signals")
 
 # Behavior flags:
 CLEAR_TODAY = os.getenv("CLEAR_TODAY", "false").lower() in ("1", "true", "yes")
-MAX_SIGNALS = int(os.getenv("MAX_SIGNALS", "150"))         # top-K per run
-VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "3.0")) # volume spike multiplier
-MIN_CONF_TO_UPLOAD = float(os.getenv("MIN_CONF_TO_UPLOAD", "0")) # optional threshold
+MAX_SIGNALS = int(os.getenv("MAX_SIGNALS", "150"))
+VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "3.0"))
+MIN_CONF_TO_UPLOAD = float(os.getenv("MIN_CONF_TO_UPLOAD", "0"))
 
 # Timeframes & Tickers
 TIME_FRAMES = os.getenv("TIME_FRAMES", "5m,15m,30m,1h").split(",")
 DEFAULT_PERIOD = os.getenv("DEFAULT_PERIOD", "7d")
 IST = pytz.timezone("Asia/Kolkata")
-MARKET_OPEN = dt_time(00, 15)
+MARKET_OPEN = dt_time(9, 15)  # Fixed: 9:15 AM IST
 MARKET_CLOSE = dt_time(15, 30)
 
 STOCK_LIST = os.getenv("STOCK_LIST", "RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS").split(",")
-TICKER_MAP = {}  # keep if needed to remap tickers
+TICKER_MAP = {}
 
 # Network & concurrency
 CPU_COUNT = max(1, (os.cpu_count() or 2))
@@ -73,8 +66,8 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("FinsparkV6.1")
 
-# JSON logger for structured events
 def json_log(event_type: str, payload: dict):
+    """Structured JSON logging for events"""
     out = {"ts": datetime.now(IST).isoformat(), "event": event_type}
     out.update(payload)
     logger.info(json.dumps(out, default=str))
@@ -101,15 +94,13 @@ def is_market_open():
     now = datetime.now(IST)
     if now.weekday() > 4:
         return False, "Weekend"
-    # Market open inclusive at MARKET_OPEN, exclusive of MARKET_CLOSE end-of-minute (configurable)
     is_open = (MARKET_OPEN <= now.time() < MARKET_CLOSE)
     return is_open, "Open" if is_open else "Closed"
 
 # ---------------- BACKOFF + JITTER ----------------
 async def backoff_sleep(attempt: int, base: float = 1.0, cap: float = 30.0):
-    # exponential backoff with jitter
     delay = min(cap, base * (2 ** attempt))
-    jitter = delay * (0.5 + random.random() * 0.5)  # 0.5x - 1.0x jitter
+    jitter = delay * (0.5 + random.random() * 0.5)
     await asyncio.sleep(jitter)
 
 # ---------------- FETCH (Yahoo V8 endpoint) ----------------
@@ -153,7 +144,6 @@ async def fetch_data(session: aiohttp.ClientSession, ticker: str, interval: str)
                 if getattr(e, "status", None) == 429:
                     await backoff_sleep(attempt, base=1.0)
                     continue
-                # other client errors - short backoff
                 await backoff_sleep(attempt, base=0.5)
                 continue
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -233,7 +223,6 @@ def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
     if pd.isna(close) or pd.isna(open_) or pd.isna(volume):
         return None
 
-    # circuit safety
     if prev_close and prev_close != 0:
         if abs(close - prev_close) / prev_close > MAX_CIRCUIT_PCT:
             json_log("skip_circuit", {"ticker": ticker, "interval": interval, "close": close, "prev_close": prev_close})
@@ -244,10 +233,12 @@ def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
         return None
 
     votes = []
+    buy_votes = 0
+    sell_votes = 0
+    hold_votes = 0
     reasons = []
     strength = 0
 
-    # trend
     tr = "Sideways"
     if not pd.isna(ind["ema20"]) and not pd.isna(ind["ema50"]):
         if ind["bb_width"] < 1.5:
@@ -261,49 +252,73 @@ def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
         reasons.append(tr)
         strength += 2
 
-    # RSI votes
     if ind["rsi"] < 30:
-        votes.append("Buy"); reasons.append(f"RSI({ind['rsi']:.1f})"); strength += 2
+        votes.append("Buy")
+        buy_votes += 1
+        reasons.append(f"RSI({ind['rsi']:.1f})")
+        strength += 2
     elif ind["rsi"] > 70:
-        votes.append("Sell"); reasons.append(f"RSI({ind['rsi']:.1f})"); strength += 2
+        votes.append("Sell")
+        sell_votes += 1
+        reasons.append(f"RSI({ind['rsi']:.1f})")
+        strength += 2
+    else:
+        hold_votes += 1
 
-    # MACD
     if ind["macd_hist"] > 0:
-        votes.append("Buy"); reasons.append("MACD_hist_pos"); strength += 1
+        votes.append("Buy")
+        buy_votes += 1
+        reasons.append("MACD_hist_pos")
+        strength += 1
     elif ind["macd_hist"] < 0:
-        votes.append("Sell"); reasons.append("MACD_hist_neg"); strength += 1
+        votes.append("Sell")
+        sell_votes += 1
+        reasons.append("MACD_hist_neg")
+        strength += 1
+    else:
+        hold_votes += 1
 
-    # Bollinger
     if close < ind["bb_lower"]:
-        votes.append("Buy"); reasons.append("BelowBB"); strength += 1
+        votes.append("Buy")
+        buy_votes += 1
+        reasons.append("BelowBB")
+        strength += 1
     elif close > ind["bb_upper"]:
-        votes.append("Sell"); reasons.append("AboveBB"); strength += 1
+        votes.append("Sell")
+        sell_votes += 1
+        reasons.append("AboveBB")
+        strength += 1
+    else:
+        hold_votes += 1
 
-    # Volume spike vote (v6.1 feature)
     vol_avg = ind.get("vol_avg") or 1
     vol_ratio = volume / vol_avg if vol_avg > 0 else 0
     if vol_ratio >= VOL_SPIKE_MULT:
         if close > open_:
-            votes.append("Buy"); reasons.append(f"VolSpike({vol_ratio:.1f}x)"); strength += 3
+            votes.append("Buy")
+            buy_votes += 1
+            reasons.append(f"VolSpike({vol_ratio:.1f}x)")
+            strength += 3
         else:
-            votes.append("Sell"); reasons.append(f"VolSpike({vol_ratio:.1f}x)"); strength += 3
-
-    # Final decision
-    buy_count = votes.count("Buy")
-    sell_count = votes.count("Sell")
+            votes.append("Sell")
+            sell_votes += 1
+            reasons.append(f"VolSpike({vol_ratio:.1f}x)")
+            strength += 3
 
     signal = "Hold"
     base_conf = 40 + min(max(strength, 0) * 4, 50)
-    if buy_count > sell_count and buy_count >= 2:
+    if buy_votes > sell_votes and buy_votes >= 2:
         signal = "Buy"
-        base_conf += buy_count * 5
-    elif sell_count > buy_count and sell_count >= 2:
+        base_conf += buy_votes * 5
+    elif sell_votes > buy_votes and sell_votes >= 2:
         signal = "Sell"
-        base_conf += sell_count * 5
+        base_conf += sell_votes * 5
+    else:
+        signal = "Hold"
+        hold_votes = max(hold_votes, 1)
 
     confidence = min(base_conf, 95.0)
 
-    # ATR fallback
     atr = ind.get("atr") if not pd.isna(ind.get("atr")) else max(close * 0.003, 1.0)
 
     sl = tp = rr = None
@@ -319,6 +334,7 @@ def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
         rr = round(reward / risk, 2) if risk > 0 else None
 
     now = datetime.now(IST)
+    
     result = {
         "symbol": ticker.replace(".NS", ""),
         "interval": interval,
@@ -328,12 +344,16 @@ def generate_signal(df: pd.DataFrame, prev_close, ticker: str, interval: str):
         "stop_loss": sl,
         "target": tp,
         "risk_reward": rr,
-        "trend": tr,
-        "vol_ratio": round(float(vol_ratio), 2),
         "signal_date": now.date().isoformat(),
         "signal_time": now.strftime("%H:%M:%S"),
-        "reasons": ", ".join(reasons),
-        "raw_indicators": ind
+        "rsi": round(float(ind["rsi"]), 2) if not pd.isna(ind["rsi"]) else None,
+        "buy_votes": buy_votes,
+        "sell_votes": sell_votes,
+        "hold_votes": hold_votes,
+        "macd": round(float(ind["macd_hist"]), 4) if not pd.isna(ind["macd_hist"]) else None,
+        "_trend": tr,
+        "_vol_ratio": round(float(vol_ratio), 2),
+        "_reasons": ", ".join(reasons)
     }
     json_log("signal_generated", {"symbol": result["symbol"], "interval": interval, "signal": signal, "confidence": result["confidence"]})
     return result
@@ -356,29 +376,21 @@ def clear_today_signals(supabase, table_name):
     except Exception as e:
         json_log("delete_failed", {"table": table_name, "error": str(e)})
 
-def append_risklog(supabase, rows):
-    try:
-        if not rows:
-            return
-        # keep raw_indicators JSON-friendly
-        for r in rows:
-            r_copy = dict(r)
-            # convert raw_indicators to json serializable (if present)
-            if "raw_indicators" in r_copy:
-                r_copy["raw_indicators"] = json.dumps(r_copy["raw_indicators"], default=str)
-            supabase.table(DB_TABLE_RISKLOG).insert(r_copy).execute()
-    except Exception as e:
-        json_log("risklog_failed", {"error": str(e)})
-
 async def upload_signals(supabase, rows, table_name):
     try:
         if not rows:
             return 0
-        # Filter by confidence threshold if set
         filtered = [r for r in rows if r.get("confidence", 0) >= MIN_CONF_TO_UPLOAD]
-        resp = supabase.table(table_name).insert(filtered).execute()
-        # try to get number inserted
-        count = len(resp.data) if hasattr(resp, "data") and isinstance(resp.data, list) else len(filtered)
+        clean_rows = []
+        for r in filtered:
+            clean_row = {k: v for k, v in r.items() if not k.startswith("_")}
+            clean_rows.append(clean_row)
+        
+        if not clean_rows:
+            return 0
+            
+        resp = supabase.table(table_name).insert(clean_rows).execute()
+        count = len(resp.data) if hasattr(resp, "data") and isinstance(resp.data, list) else len(clean_rows)
         json_log("upload_complete", {"table": table_name, "uploaded": count})
         return count
     except Exception as e:
@@ -390,14 +402,13 @@ async def run_engine():
     supabase = ensure_supabase()
     market_open, status = is_market_open()
     json_log("engine_start", {"market_status": status, "timestamp": datetime.now(IST).isoformat(), "concurrency": CONCURRENCY_LIMIT})
+    
     if not market_open:
         logger.info("Market closed — exiting without generating signals.")
-        # still do controlled cleanup if requested
         if CLEAR_TODAY:
             clear_today_signals(supabase, DB_TABLE_SIGNALS)
         return
 
-    # safe daily deletion (env gated)
     if CLEAR_TODAY:
         clear_today_signals(supabase, DB_TABLE_SIGNALS)
 
@@ -407,16 +418,13 @@ async def run_engine():
             for tf in TIME_FRAMES:
                 tasks.append(fetch_data(session, ticker.strip(), tf.strip()))
 
-        # run fetches concurrently
         raw_results = await asyncio.gather(*tasks)
-    # map by key robustly
+    
     signals = []
-    risklog_rows = []
     for item in raw_results:
         try:
             (ticker, interval), df, prev = item
         except Exception:
-            # Some fetch tasks may return (key, None, None) shape; handle defensively
             if isinstance(item, tuple) and len(item) == 3:
                 key = item[0] if len(item) > 0 else ("UNK", "UNK")
                 ticker, interval = key if isinstance(key, tuple) else ("UNK", "UNK")
@@ -427,51 +435,20 @@ async def run_engine():
 
         if df is None:
             json_log("fetch_no_data", {"ticker": ticker, "interval": interval})
-            # log error
-            try:
-                supabase.table(DB_TABLE_ERRORS).insert({
-                    "timestamp": datetime.now(IST).isoformat(),
-                    "error_type": "FetchNoData",
-                    "message": f"No data for {ticker} {interval}",
-                    "stock": ticker, "interval": interval
-                }).execute()
-            except Exception:
-                pass
+            logger.warning(f"No data for {ticker} {interval}")
             continue
 
         s = generate_signal(df, prev, ticker, interval)
         if s:
             signals.append(s)
-            # prepare risk log row (append-only)
-            risklog_rows.append({
-                "timestamp": datetime.now(IST).isoformat(),
-                "symbol": s["symbol"],
-                "interval": s["interval"],
-                "signal": s["signal"],
-                "confidence": s["confidence"],
-                "close_price": s["close_price"],
-                "stop_loss": s["stop_loss"],
-                "target": s["target"],
-                "risk_reward": s["risk_reward"],
-                "reasons": s["reasons"],
-                "raw_indicators": json.dumps(s.get("raw_indicators", {}), default=str)
-            })
 
-    # apply top-K limiter (v6.1 feature)
     if signals:
         signals_sorted = sorted(signals, key=lambda r: (r.get("confidence", 0)), reverse=True)
         top_signals = signals_sorted[:MAX_SIGNALS]
     else:
         top_signals = []
 
-    # upload signals (non-destructive to other tables)
     uploaded_count = await upload_signals(supabase, top_signals, DB_TABLE_SIGNALS)
-
-    # append to risk log regardless of upload (append-only)
-    try:
-        append_risklog(supabase, risklog_rows)
-    except Exception as e:
-        json_log("risklog_upload_error", {"error": str(e)})
 
     json_log("engine_end", {
         "signals_generated": len(signals),
