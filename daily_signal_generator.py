@@ -528,12 +528,13 @@ def main():
                 print(f" 🔴 {row['symbol']:12s} {row['confidence']:.0f}% ₹{row['close_price']:.2f} → T:₹{row['target']} R:R{row['risk_reward']}")
         valid_rr = df[df['risk_reward'].notna()]['risk_reward']
         if len(valid_rr)>0:print(f"\n🎯 Avg R:R:{valid_rr.mean():.2f}")
- if failed_tickers:print(f"\n⚠️ Failed:{', '.join([t.replace('.NS','')for t in failed_tickers[:10]])}");
- if len(failed_tickers)>10:print(f"   +{len(failed_tickers)-10} more")
- print("\n"+"="*70)
- print("✅ v6.4.1 FINAL COMPLETE!")
- print(f"🕐 {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}")
- print("🏆 Wilder's RSI/ATR|Gap-Proof|S-Tier|92% Correlation")
- print("="*70)
- sys.exit(0 if success>0 else 1)
-if __name__=="__main__":main()
+         if failed_tickers:print(f"\n⚠️ Failed:{', '.join([t.replace('.NS','')for t in failed_tickers[:10]])}");
+         if len(failed_tickers)>10:print(f"   +{len(failed_tickers)-10} more")
+         print("\n"+"="*70)
+         print("✅ v6.4.1 FINAL COMPLETE!")
+         print(f"🕐 {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}")
+         print("🏆 Wilder's RSI/ATR|Gap-Proof|S-Tier|92% Correlation")
+         print("="*70)
+         sys.exit(0 if success>0 else 1)
+         if __name__=="__main__":main()
+
