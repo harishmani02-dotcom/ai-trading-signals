@@ -289,13 +289,19 @@ def main():
  results=[];failed_tickers=[]
  with ThreadPoolExecutor(max_workers=MAX_WORKERS)as executor:
   future_to_stock={executor.submit(generate_signal,stock,i+1,len(STOCKS)):stock for i,stock in enumerate(STOCKS)}
-  for future in as_completed(future_to_stock):
-   stock=future_to_stock[future]
-   try:signal=future.result();
-   finally:
-    if 'signal' in locals():
-        results.append(signal)
-   else:failed_tickers.append(stock)
+for future in as_completed(future_to_stock):
+    stock = future_to_stock[future]
+    try:
+        signal = future.result()
+    except Exception as e:
+        logger.error(f"{stock}:{e}")
+        failed_tickers.append(stock)
+    else:
+        if signal is not None:
+            results.append(signal)
+        else:
+            failed_tickers.append(stock)
+
    except Exception as e:logger.error(f"{stock}:{e}");failed_tickers.append(stock)
  if results:results_sorted=sorted(results,key=lambda r:r.get("confidence",0),reverse=True);top_signals=results_sorted[:MAX_SIGNALS]
  else:top_signals=[]
