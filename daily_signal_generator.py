@@ -292,7 +292,9 @@ def main():
   for future in as_completed(future_to_stock):
    stock=future_to_stock[future]
    try:signal=future.result();
-   finally signal:results.append(signal)
+   finally:
+    if 'signal' in locals():
+        results.append(signal)
    else:failed_tickers.append(stock)
    except Exception as e:logger.error(f"{stock}:{e}");failed_tickers.append(stock)
  if results:results_sorted=sorted(results,key=lambda r:r.get("confidence",0),reverse=True);top_signals=results_sorted[:MAX_SIGNALS]
