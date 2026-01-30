@@ -1,4 +1,4 @@
-name: Intraday Signal Generator
+name: Intraday Signal Generator 
 
 on:
   schedule:
