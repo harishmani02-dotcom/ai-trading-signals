@@ -43,7 +43,7 @@ jobs:
       - name: Self-trigger next run if market still open
         if: always()
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python - <<'EOF'
           import urllib.request, urllib.error, json, os, sys
