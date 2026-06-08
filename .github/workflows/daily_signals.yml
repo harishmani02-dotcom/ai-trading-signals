@@ -1,42 +1,23 @@
-name: Intraday Signal Generator 
+name: Intraday Signal Generator
 
 on:
   schedule:
-    - cron: '45 3 * * 1-5'
-    - cron: '0 4 * * 1-5'
-    - cron: '15 4 * * 1-5'
-    - cron: '30 4 * * 1-5'
-    - cron: '45 4 * * 1-5'
-    - cron: '0 5 * * 1-5'
-    - cron: '15 5 * * 1-5'
-    - cron: '30 5 * * 1-5'
-    - cron: '45 5 * * 1-5'
-    - cron: '0 6 * * 1-5'
-    - cron: '15 6 * * 1-5'
-    - cron: '30 6 * * 1-5'
-    - cron: '45 6 * * 1-5'
-    - cron: '0 7 * * 1-5'
-    - cron: '15 7 * * 1-5'
-    - cron: '30 7 * * 1-5'
-    - cron: '45 7 * * 1-5'
-    - cron: '0 8 * * 1-5'
-    - cron: '15 8 * * 1-5'
-    - cron: '30 8 * * 1-5'
-    - cron: '45 8 * * 1-5'
-    - cron: '0 9 * * 1-5'
-    - cron: '15 9 * * 1-5'
-    - cron: '30 9 * * 1-5'
-    - cron: '45 9 * * 1-5' # 3:15 PM IST
-    - cron: '0 10 * * 1-5' # 3:30 PM IST (Last run)
+    - cron: '45 3 * * 1-5'    # 9:15 AM IST — initial trigger
+    - cron: '45 9 * * 1-5'    # 3:15 PM IST — safety re-trigger if morning missed
   workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Trigger reason'
+        default: 'manual'
 
 concurrency:
   group: intraday-signals
-  cancel-in-progress: true
+  cancel-in-progress: false    # queue, never cancel
 
 jobs:
   generate-signals:
     runs-on: ubuntu-latest
+    timeout-minutes: 25        # each run = one 15-min cycle only
 
     steps:
       - name: Checkout code
@@ -52,17 +33,43 @@ jobs:
           pip install --upgrade pip
           pip install yfinance pandas numpy supabase aiohttp pytz
 
-      - name: Run intraday signals
+      - name: Run ONE signal cycle
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          STOCK_LIST: ${{ secrets.STOCK_LIST }}
+          STOCK_LIST:   ${{ secrets.STOCK_LIST }}
         run: python daily_signal_generator.py
 
-      - name: Upload logs
+      - name: Self-trigger next run if market still open
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs
-          path: '*.log'
-          retention-days: 3
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          python - <<'EOF'
+          import urllib.request, urllib.error, json, os
+          from datetime import datetime
+          import pytz
+
+          IST   = pytz.timezone('Asia/Kolkata')
+          now   = datetime.now(IST)
+          close = now.replace(hour=15, minute=15, second=0, microsecond=0)
+
+          if now.weekday() > 4 or now >= close:
+              print(f"Market closed or weekend ({now.strftime('%H:%M IST')}). Not re-triggering.")
+              exit(0)
+
+          token = os.environ['GH_PAT']
+          url   = "https://api.github.com/repos/harishmani02-dotcom/ai-trading-signals/actions/workflows/daily_signals.yml/dispatches"
+          data  = json.dumps({"ref": "main", "inputs": {"reason": "self-trigger"}}).encode()
+          req   = urllib.request.Request(url, data=data, method='POST')
+          req.add_header("Authorization", f"Bearer {token}")
+          req.add_header("Accept",        "application/vnd.github+json")
+          req.add_header("Content-Type",  "application/json")
+
+          try:
+              urllib.request.urlopen(req, timeout=10)
+              print(f"✅ Next run triggered at {now.strftime('%H:%M IST')}")
+          except urllib.error.HTTPError as e:
+              print(f"❌ Trigger failed: {e.code} {e.reason}")
+              exit(1)
+          EOF
