@@ -46,30 +46,50 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           python - <<'EOF'
-          import urllib.request, urllib.error, json, os
+          import urllib.request, urllib.error, json, os, sys
           from datetime import datetime
           import pytz
 
           IST   = pytz.timezone('Asia/Kolkata')
           now   = datetime.now(IST)
+
+          # Stop triggering after 3:15 PM IST (last cycle — market closes 3:30 PM)
           close = now.replace(hour=15, minute=15, second=0, microsecond=0)
 
-          if now.weekday() > 4 or now >= close:
-              print(f"Market closed or weekend ({now.strftime('%H:%M IST')}). Not re-triggering.")
-              exit(0)
+          # Exit silently if weekend or market closed
+          if now.weekday() > 4:
+              print(f"Weekend — not re-triggering.")
+              sys.exit(0)
 
-          token = os.environ['GH_PAT']
-          url   = "https://api.github.com/repos/harishmani02-dotcom/ai-trading-signals/actions/workflows/daily_signals.yml/dispatches"
-          data  = json.dumps({"ref": "main", "inputs": {"reason": "self-trigger"}}).encode()
-          req   = urllib.request.Request(url, data=data, method='POST')
+          if now >= close:
+              print(f"Market closing soon ({now.strftime('%H:%M IST')}) — not re-triggering.")
+              sys.exit(0)
+
+          # Check token exists
+          token = os.environ.get('GH_PAT', '').strip()
+          if not token:
+              print("❌ GH_PAT secret is missing or empty.")
+              sys.exit(1)
+
+          url  = "https://api.github.com/repos/harishmani02-dotcom/ai-trading-signals/actions/workflows/daily_signals.yml/dispatches"
+          body = json.dumps({"ref": "main", "inputs": {"reason": "self-trigger"}}).encode()
+
+          req = urllib.request.Request(url, data=body, method='POST')
           req.add_header("Authorization", f"Bearer {token}")
           req.add_header("Accept",        "application/vnd.github+json")
           req.add_header("Content-Type",  "application/json")
+          req.add_header("X-GitHub-Api-Version", "2022-11-28")
 
           try:
-              urllib.request.urlopen(req, timeout=10)
-              print(f"✅ Next run triggered at {now.strftime('%H:%M IST')}")
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"✅ Next run triggered at {now.strftime('%H:%M IST')} "
+                        f"(HTTP {resp.status})")
           except urllib.error.HTTPError as e:
+              body_err = e.read().decode('utf-8', errors='ignore')
               print(f"❌ Trigger failed: {e.code} {e.reason}")
-              exit(1)
+              print(f"   Detail: {body_err}")
+              sys.exit(1)
+          except urllib.error.URLError as e:
+              print(f"❌ Network error: {e.reason}")
+              sys.exit(1)
           EOF
